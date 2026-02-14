@@ -1,0 +1,96 @@
+{
+    "title": "Bazos.cz Scraper",
+    "type": "object", 
+    "schemaVersion": 1,
+    "properties": {
+        "categories": {
+            "title": "Categories to scrape",
+            "type": "array",
+            "description": "List of Bazos.cz categories to scrape. Leave empty to scrape all categories.",
+            "editor": "select",
+            "items": {
+                "type": "string",
+                "enum": [
+                    "auto",
+                    "deti",
+                    "dum",
+                    "elektro",
+                    "foto",
+                    "hudba",
+                    "knihy",
+                    "mobil",
+                    "motorky",
+                    "nabytek",
+                    "obleceni",
+                    "pc",
+                    "prace",
+                    "reality",
+                    "sluzby",
+                    "sport",
+                    "stroje",
+                    "vstupenky",
+                    "zvirata",
+                    "ostatni"
+                ],
+                "enumTitles": [
+                    "Auto (Cars)",
+                    "Děti (Children)",
+                    "Dům a zahrada (House & Garden)",
+                    "Elektro (Electronics)",
+                    "Foto (Photography)",
+                    "Hudba (Music)",
+                    "Knihy (Books)",
+                    "Mobil (Mobile)",
+                    "Motorky (Motorcycles)",
+                    "Nábytek (Furniture)",
+                    "Oblečení (Clothing)",
+                    "PC (Computers)",
+                    "Práce (Jobs)",
+                    "Reality (Real Estate)",
+                    "Služby (Services)",
+                    "Sport (Sports)",
+                    "Stroje (Machinery)",
+                    "Vstupenky (Tickets)",
+                    "Zvířata (Animals)",
+                    "Ostatní (Other)"
+                ]
+            }
+        },
+        "maxListings": {
+            "title": "Maximum listings per category",
+            "type": "integer",
+            "description": "Maximum number of listings to scrape per category (0 = unlimited)",
+            "minimum": 0
+        },
+        "includeDetailedData": {
+            "title": "Include detailed data",
+            "type": "boolean", 
+            "description": "Whether to scrape detailed information from individual listing pages"
+        },
+        "searchQuery": {
+            "title": "Search query",
+            "type": "string",
+            "description": "Optional search term to filter listings",
+            "editor": "textfield"
+        },
+        "location": {
+            "title": "Location filter",
+            "type": "string", 
+            "description": "Optional location (city or postal code) to filter listings",
+            "editor": "textfield"
+        },
+        "priceMin": {
+            "title": "Minimum price (CZK)",
+            "type": "integer",
+            "description": "Minimum price filter in Czech Koruna",
+            "minimum": 0
+        },
+        "priceMax": {
+            "title": "Maximum price (CZK)", 
+            "type": "integer",
+            "description": "Maximum price filter in Czech Koruna",
+            "minimum": 0
+        }
+    },
+    "required": ["categories"]
+}
