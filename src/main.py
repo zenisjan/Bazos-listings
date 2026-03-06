@@ -447,9 +447,9 @@ async def main() -> None:
         price_max = actor_input.get('priceMax')
         
         # Get actor run information
-        actor_run_id = os.environ.get("ACTOR_RUN_ID")
+        actor_run_id = os.environ.get('APIFY_ACTOR_RUN_ID') or os.environ.get('ACTOR_RUN_ID')
         if not actor_run_id:
-            actor_run_id = f"local-{datetime.now().strftime("%Y%m%d-%H%M%S")}"
+            actor_run_id = f"local-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         actor_run_start = datetime.now()
         
         Actor.log.info(f"Starting Bazos.cz scraper with categories: {categories}")
