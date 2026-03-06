@@ -3,6 +3,7 @@
 
 apify < 3.0.0
 pydantic>=2.8.0,<2.12.0
+browserforge<1.2.4
 beautifulsoup4[lxml]
 httpx
 types-beautifulsoup4
