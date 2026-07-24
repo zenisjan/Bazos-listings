@@ -14,7 +14,7 @@ import re
 import sys
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from apify import Actor
 from bs4 import BeautifulSoup
@@ -58,13 +58,70 @@ CATEGORY_DOMAINS = {
 }
 
 
+# Safety margin (seconds) subtracted from the Apify hard timeout so the run can
+# stop scraping, flush its data, and mark the actor_run "completed" before the
+# platform kills it (which would otherwise leave the run stuck as "running" and
+# break sold-detection).
+_DEADLINE_MARGIN_SECS = 120
+
+
+def _run_deadline() -> Optional[datetime]:
+    """Return the UTC time to stop scraping by, derived from the Apify timeout.
+
+    Apify exposes the run's hard-timeout instant as an ISO 8601 env var. We stop
+    a couple of minutes early so there is time to save and close out cleanly.
+    Returns None (no limit) for local runs where the var is absent.
+    """
+    iso = os.environ.get("APIFY_TIMEOUT_AT") or os.environ.get("ACTOR_TIMEOUT_AT")
+    if not iso:
+        return None
+    try:
+        deadline = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return deadline - timedelta(seconds=_DEADLINE_MARGIN_SECS)
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class _FailRunOnCrash:
+    """Marks the actor_runs row 'failed' if the run dies with an unhandled error.
+
+    Historically a terminal status was written only on the happy path, so a crash
+    (or an Apify hard-timeout kill) left the row 'running' forever and the web app
+    could not tell a dead run from a live one — sold-detection then mistreated the
+    run's listings. Used as `async with Actor, _FailRunOnCrash():` so it exits
+    before Actor; the exception still propagates and fails the platform run too.
+    """
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if exc_type is not None:
+            try:
+                Actor.log.error(f"Run failed with unhandled error: {exc!r}")
+                db_manager.update_actor_run_status("failed", 0)
+                db_manager.close_pool()
+            except Exception as finalize_error:
+                Actor.log.error(f"Could not mark run failed: {finalize_error}")
+        return False
+
+
 class BazosScraper:
     """Main scraper class for Bazos.cz listings with enhanced pagination."""
-    
+
     def __init__(self, client: AsyncClient):
         self.client = client
         self.scraped_listings = set()
-        
+        # UTC instant to stop scraping by (set from the Apify timeout in main()).
+        self.deadline: Optional[datetime] = None
+
+    def _past_deadline(self) -> bool:
+        return self.deadline is not None and _now_utc() >= self.deadline
+
     async def scrape_category_listings(
         self, 
         category: str,
@@ -87,6 +144,13 @@ class BazosScraper:
         Actor.log.info(f"Starting to scrape category: {category}")
         
         while True:
+            if self._past_deadline():
+                Actor.log.warning(
+                    f"Run time budget reached while paging {category}; "
+                    f"stopping at {len(listings)} listings"
+                )
+                break
+
             # Build URL with filters and pagination
             url = self._build_search_url(
                 base_url, page_offset, search_query, location, price_min, price_max
@@ -429,7 +493,7 @@ class BazosScraper:
 async def main() -> None:
     """Main entry point for the Bazos.cz scraper with enhanced pagination and database integration."""
     
-    async with Actor:
+    async with Actor, _FailRunOnCrash():
         # Get input configuration
         actor_input = await Actor.get_input() or {}
         
@@ -502,12 +566,18 @@ async def main() -> None:
         
         async with AsyncClient(headers=headers, timeout=30.0) as client:
             scraper = BazosScraper(client)
-            
+            scraper.deadline = _run_deadline()
+            if scraper.deadline:
+                Actor.log.info(f"Run time budget until (UTC): {scraper.deadline.isoformat()}")
+
             all_listings = []
             total_pages_scraped = 0
             
             # Scrape each category
             for category_index, category in enumerate(categories):
+                if scraper._past_deadline():
+                    Actor.log.warning("Run time budget reached; stopping before remaining categories")
+                    break
                 if category not in CATEGORY_DOMAINS:
                     Actor.log.warning(f"Unknown category: {category}, skipping")
                     continue
@@ -544,7 +614,18 @@ async def main() -> None:
                             # Progress update
                             if (i + 1) % 10 == 0:
                                 Actor.log.info(f"Scraped detailed data for {i + 1}/{len(category_listings)} listings")
-                            
+
+                            # Keep the rest card-only if the budget runs out
+                            # mid-category, so what we already have still saves.
+                            if scraper._past_deadline():
+                                Actor.log.warning(
+                                    f"Run time budget reached mid-detail; keeping "
+                                    f"{len(detailed_listings)} enriched + "
+                                    f"{len(category_listings) - len(detailed_listings)} card-only"
+                                )
+                                detailed_listings.extend(category_listings[len(detailed_listings):])
+                                break
+
                             # Rate limiting for detailed scraping
                             await asyncio.sleep(0.5)
                         
@@ -587,10 +668,16 @@ async def main() -> None:
             Actor.log.info(f"Total listings scraped: {len(all_listings)}")
             Actor.log.info(f"Categories processed: {len(categories)}")
             
+            # Zero listings almost always means upstream breakage (site change,
+            # consent wall, block) rather than an empty market — mark the run
+            # 'failed' so sold-detection ignores it instead of flagging every
+            # previously-seen listing as sold.
+            run_status = 'completed' if all_listings else 'failed'
+
             # Update actor run status in database
             if db_manager_available:
                 try:
-                    db_manager.update_actor_run_status('completed', len(all_listings))
+                    db_manager.update_actor_run_status(run_status, len(all_listings))
                     db_manager.close_pool()
                     Actor.log.info("Database connection closed successfully")
                 except Exception as e:
