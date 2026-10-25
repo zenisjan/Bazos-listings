@@ -108,6 +108,14 @@
             "type": "integer",
             "description": "Maximum price filter in Czech Koruna",
             "minimum": 0
+        },
+        "proxyConfiguration": {
+            "title": "Proxy configuration",
+            "type": "object",
+            "description": "Proxy for the list (search result) pages. bazos answers HTTP 429 (Too Many Requests) once one IP has paged through about 150 of them in a few minutes, so through a proxy they go out from a new IP every 50 pages and after a 429. Detail pages always go direct. Defaults to Apify Proxy residential IPs in Czechia. Without a proxy, list pages are paced more slowly after each 429.",
+            "editor": "proxy",
+            "prefill": {"useApifyProxy": true, "apifyProxyGroups": ["RESIDENTIAL"], "apifyProxyCountry": "CZ"},
+            "default": {"useApifyProxy": true, "apifyProxyGroups": ["RESIDENTIAL"], "apifyProxyCountry": "CZ"}
         }
     },
     "required": ["categories"]

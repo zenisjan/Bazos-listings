@@ -14,6 +14,7 @@ import copy
 import math
 import re
 import sys
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
@@ -219,39 +220,132 @@ def _short_error(e: BaseException) -> str:
 
 
 # Bounded exponential backoff for transient fetch failures (timeouts, resets,
-# 429/5xx). A single flaky response used to abort an entire category scrape.
-_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+# 5xx). A single flaky response used to abort an entire category scrape.
+_RETRYABLE_STATUS = {500, 502, 503, 504}
+
+# bazos rate-limits list pages per IP: the Apify IP of a regional car run got
+# HTTP 429 after ~150 list pages in 3 minutes (2026-10-25), and for every list
+# page in the next minute, while detail pages at 4/s kept working. A 429 is
+# retried after each of these waits in turn: from a single IP they must outlast
+# that pause; through a rotating proxy the retry has another IP, so short ones do.
+RATE_LIMIT_WAITS_SECS = (30.0, 60.0, 120.0, 240.0)
+ROTATING_RATE_LIMIT_WAITS_SECS = (2.0, 4.0, 8.0, 16.0)
+# Pause before each list page; from a single IP doubled after every 429, up to the max.
+PAGE_DELAY_SECS = 1.0
+PAGE_DELAY_MAX_SECS = 8.0
+# Through a proxy, list pages leave from one IP for at most this many requests,
+# and a failed one is retried (from another IP) up to this many attempts in all:
+# residential connections fail more often than direct ones.
+LIST_PAGES_PER_IP = 50
+ROTATING_LIST_ATTEMPTS = 5
 
 
-async def _request_with_retry(client, method, url, attempts=3, give_up=None, **kwargs):
+def _no_time_for(delay: float, time_left) -> bool:
+    """Whether waiting `delay` seconds would outlast the run's time budget."""
+    return time_left is not None and delay >= time_left()
+
+
+async def _request_with_retry(
+    client, method, url, attempts=3, time_left=None,
+    rate_limit_waits=RATE_LIMIT_WAITS_SECS, on_rate_limited=None, **kwargs,
+):
     """Issue a request, retrying transient failures with exponential backoff.
 
     Returns the final response without raising for status (callers keep their
     own raise_for_status()); re-raises the last transport error if the
-    connection itself keeps failing. No retry once `give_up()` is true (the
-    run's time budget is spent: the margin is for saving, not for retries).
+    connection itself keeps failing. An HTTP 429 is retried after each of
+    `rate_limit_waits` in turn, on top of the `attempts`, and reported to
+    `on_rate_limited()`. No retry whose wait would outlast `time_left()`, the
+    seconds left of the run's time budget (the margin after it is for saving,
+    not for retries).
     """
-    for attempt in range(1, attempts + 1):
+    failures = rate_limits = 0
+    while True:
         try:
             response = await client.request(method, url, **kwargs)
         except TransportError as e:
-            if attempt == attempts or (give_up is not None and give_up()):
+            failures += 1
+            delay = 2.0 * 2 ** (failures - 1)
+            if failures == attempts or _no_time_for(delay, time_left):
                 raise
             reason = repr(e)
         else:
-            if (
-                response.status_code not in _RETRYABLE_STATUS
-                or attempt == attempts
-                or (give_up is not None and give_up())
-            ):
+            if response.status_code == 429:
+                if on_rate_limited is not None:
+                    on_rate_limited()
+                if rate_limits == len(rate_limit_waits) or _no_time_for(
+                    rate_limit_waits[rate_limits], time_left
+                ):
+                    return response
+                delay = rate_limit_waits[rate_limits]
+                rate_limits += 1
+                Actor.log.warning(
+                    f"Rate limited (HTTP 429); retry {rate_limits}/{len(rate_limit_waits)} "
+                    f"in {delay:.0f}s: {url}"
+                )
+                await asyncio.sleep(delay)
+                continue
+            if response.status_code not in _RETRYABLE_STATUS:
+                return response
+            failures += 1
+            delay = 2.0 * 2 ** (failures - 1)
+            if failures == attempts or _no_time_for(delay, time_left):
                 return response
             reason = f"HTTP {response.status_code}"
-        delay = 2.0 * (2 ** (attempt - 1))
         Actor.log.warning(
-            f"Transient fetch failure ({reason}); retry {attempt}/{attempts - 1} "
+            f"Transient fetch failure ({reason}); retry {failures}/{attempts - 1} "
             f"in {delay:.0f}s: {url}"
         )
         await asyncio.sleep(delay)
+
+
+class _RotatingIpClient:
+    """Sends requests through Apify Proxy from an IP that keeps changing.
+
+    Without a session, Apify Proxy picks an IP per connection. One connection
+    serves LIST_PAGES_PER_IP requests (each new one costs a TLS handshake through
+    the proxy) and is then replaced, as is one that got an HTTP 429 or failed.
+    """
+
+    def __init__(self, proxy_url: str, **client_kwargs):
+        self._proxy_url = proxy_url
+        self._client_kwargs = client_kwargs
+        self._client: Optional[AsyncClient] = None
+        self._used = 0
+
+    async def request(self, method: str, url: str, **kwargs):
+        if self._client is None or self._used >= LIST_PAGES_PER_IP:
+            await self.aclose()
+            self._client = AsyncClient(proxy=self._proxy_url, **self._client_kwargs)
+            self._used = 0
+        self._used += 1
+        try:
+            response = await self._client.request(method, url, **kwargs)
+        except TransportError:
+            self._used = LIST_PAGES_PER_IP  # the retry goes out from another IP
+            raise
+        if response.status_code == 429:
+            self._used = LIST_PAGES_PER_IP
+        return response
+
+    async def aclose(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+
+@asynccontextmanager
+async def _list_page_client(proxy_url: Optional[str], **client_kwargs):
+    """A _RotatingIpClient through `proxy_url` for the list pages, or None
+    (without a proxy they share the direct client)."""
+    if not proxy_url:
+        yield None
+        return
+    client = _RotatingIpClient(proxy_url, **client_kwargs)
+    try:
+        yield client
+    finally:
+        await client.aclose()
 
 
 class _FailRunOnCrash:
@@ -319,8 +413,16 @@ class _Paged:
 class BazosScraper:
     """Main scraper class for Bazos.cz listings with enhanced pagination."""
 
-    def __init__(self, client: AsyncClient):
+    def __init__(self, client: AsyncClient, list_client: Optional[_RotatingIpClient] = None):
         self.client = client
+        # List pages, which bazos rate-limits per IP (see RATE_LIMIT_WAITS_SECS),
+        # go through `list_client` when a proxy is configured; detail pages
+        # always go direct.
+        self.list_client = list_client or client
+        self._list_rate_limit_waits = (
+            ROTATING_RATE_LIMIT_WAITS_SECS if list_client else RATE_LIMIT_WAITS_SECS
+        )
+        self.page_delay = PAGE_DELAY_SECS
         self.scraped_listings = set()
         # UTC instant to stop scraping by (set from the Apify timeout in main()).
         self.deadline: Optional[datetime] = None
@@ -337,6 +439,32 @@ class BazosScraper:
 
     def _past_deadline(self) -> bool:
         return self.deadline is not None and _now_utc() >= self.deadline
+
+    def _secs_left(self) -> float:
+        """Seconds of the run's time budget left (infinite without a deadline)."""
+        if self.deadline is None:
+            return math.inf
+        return (self.deadline - _now_utc()).total_seconds()
+
+    async def _get_list_page(self, url: str):
+        rotating = self.list_client is not self.client
+        return await _request_with_retry(
+            self.list_client, "GET", url, follow_redirects=True,
+            attempts=ROTATING_LIST_ATTEMPTS if rotating else 3,
+            time_left=self._secs_left,
+            rate_limit_waits=self._list_rate_limit_waits,
+            on_rate_limited=self._on_list_rate_limited,
+        )
+
+    def _on_list_rate_limited(self) -> None:
+        """bazos answered a list page HTTP 429. Through a proxy the retry has
+        another IP; from a single IP, page more slowly from now on."""
+        if self.list_client is not self.client or self.page_delay >= PAGE_DELAY_MAX_SECS:
+            return
+        self.page_delay = min(self.page_delay * 2, PAGE_DELAY_MAX_SECS)
+        Actor.log.warning(
+            f"bazos is rate-limiting list pages: {self.page_delay:.0f} s between them from now on"
+        )
 
     async def scrape_category_listings(
         self,
@@ -399,7 +527,7 @@ class BazosScraper:
                 )
                 break
             if i:
-                await asyncio.sleep(1)
+                await asyncio.sleep(self.page_delay)
             path = f"/{sub}/"
             name = self._search_name(search, path, search.price_min, search.price_max)
             listings_before, pages_before = len(search.listings), self._pages_scraped
@@ -484,7 +612,7 @@ class BazosScraper:
                     f"{name}: run time budget reached while splitting it by subcategory"
                 )
                 return
-            await asyncio.sleep(1)
+            await asyncio.sleep(self.page_delay)
             self._split_searches_left -= 1
             totals[sub] = await self._probe_total(search, sub, lo, hi)
         covered = sum(t for t in totals.values() if t)
@@ -503,7 +631,7 @@ class BazosScraper:
                     f"{len(todo)} subcategories not scraped"
                 )
                 break
-            await asyncio.sleep(1)
+            await asyncio.sleep(self.page_delay)
             await self._scrape_search(search, sub, lo, hi)
 
     async def _split_by_price(
@@ -527,7 +655,7 @@ class BazosScraper:
                     f"{_price_range_text(band_lo, band_hi)} not scraped"
                 )
                 break
-            await asyncio.sleep(1)
+            await asyncio.sleep(self.page_delay)
             await self._scrape_search(search, path, band_lo, band_hi)
 
     async def _scrape_pages(
@@ -570,9 +698,7 @@ class BazosScraper:
                     first_page = None
                 else:
                     Actor.log.info(f"Scraping page {page_number} (offset {page_offset}): {url}")
-                    response = await _request_with_retry(
-                        self.client, "GET", url, follow_redirects=True, give_up=self._past_deadline
-                    )
+                    response = await self._get_list_page(url)
                     soup = BeautifulSoup(response.content, 'lxml')
 
                 # Checked before raise_for_status(): bazos serves a page past the
@@ -633,7 +759,7 @@ class BazosScraper:
                 page_number += 1
 
                 # Rate limiting between pages
-                await asyncio.sleep(1)
+                await asyncio.sleep(self.page_delay)
 
             except Exception as e:
                 self._record_page_failure(name, page_number, url, e)
@@ -649,9 +775,7 @@ class BazosScraper:
         url = self._search_url(search, path, 0, lo, hi)
         Actor.log.info(f"Reading the result count of {url}")
         try:
-            response = await _request_with_retry(
-                self.client, "GET", url, follow_redirects=True, give_up=self._past_deadline
-            )
+            response = await self._get_list_page(url)
             response.raise_for_status()  # page 1: never a 404 (see _scrape_pages)
             self._check_landed(response, search, path)
             soup = BeautifulSoup(response.content, 'lxml')
@@ -899,7 +1023,7 @@ class BazosScraper:
         try:
             response = await _request_with_retry(
                 self.client, "GET", listing['url'], follow_redirects=True,
-                give_up=self._past_deadline,
+                time_left=self._secs_left,
             )
             response.raise_for_status()
             details = self._extract_detailed_data(BeautifulSoup(response.content, 'lxml'))
@@ -1216,8 +1340,22 @@ async def main() -> None:
             'Upgrade-Insecure-Requests': '1'
         }
         
-        async with AsyncClient(headers=headers, timeout=30.0) as client:
-            scraper = BazosScraper(client)
+        # (Given no proxy input, the SDK would configure Apify Proxy anyway.)
+        proxy_input = actor_input.get('proxyConfiguration')
+        proxy_configuration = (
+            await Actor.create_proxy_configuration(actor_proxy_input=proxy_input)
+            if isinstance(proxy_input, dict) else None
+        )
+        proxy_url = await proxy_configuration.new_url() if proxy_configuration else None
+        if proxy_url:
+            Actor.log.info(
+                f"List pages go through Apify Proxy, from a new IP every "
+                f"{LIST_PAGES_PER_IP} pages and after a 429; detail pages go direct"
+            )
+
+        async with AsyncClient(headers=headers, timeout=30.0) as client, \
+                _list_page_client(proxy_url, headers=headers, timeout=30.0) as list_client:
+            scraper = BazosScraper(client, list_client)
             scraper.deadline = _run_deadline()
             if scraper.deadline:
                 Actor.log.info(f"Run time budget until (UTC): {scraper.deadline.isoformat()}")

@@ -31,6 +31,7 @@ A comprehensive Apify Actor for scraping classified advertisements from Bazos.cz
 - **locationLabel** (string): Readable name of the searched area, stored as the run's `location_filter` (default: `"<location> +<radius> km"`, or the location). The web app treats runs with the same search query and `location_filter` as one slice for sold detection, so each regional scraper row needs its own value.
 - **priceMin** (integer): Minimum price filter in CZK
 - **priceMax** (integer): Maximum price filter in CZK
+- **proxyConfiguration** (object): Proxy for the list (search result) pages (default: Apify Proxy, `RESIDENTIAL`, country `CZ`). bazos answers HTTP 429 once one IP has paged through about 150 list pages in a few minutes, so through a proxy they go out from a new IP every 50 pages and after a 429. Detail pages always go direct: bazos doesn't limit them at the scraper's pace.
 
 On the Apify platform a run without a database (`DB_HOST` unset, or the connection fails) fails at once instead of scraping into the dataset only; local runs carry on without one.
 
@@ -128,7 +129,7 @@ A subcategory reporting more than 19,500 results (bazos serves 20,000 per search
 - **Language**: Python 3.13+
 - **Parsing**: BeautifulSoup with lxml parser
 - **HTTP Client**: HTTPX for async requests
-- **Rate Limiting**: 1-second delay between pages, 0.5-second delay for detailed scraping
+- **Rate Limiting**: 1-second delay between list pages; detail pages 4 at a time, at most 4 requests per second
 - **Error Handling**: Graceful handling of missing elements and network errors
 
 ## Performance
@@ -219,8 +220,9 @@ Set `maxListings: 0` to scrape ALL available listings from a category:
 This will continue scraping until all pages are exhausted, potentially collecting thousands of listings per category.
 
 ### **Rate Limiting**
-- **Page Delays**: 1-second delay between pages to be respectful
-- **Detailed Scraping**: 0.5-second delay between detailed page requests
+- **Page Delays**: 1-second delay between list pages to be respectful
+- **Detailed Scraping**: 4 detail pages at a time, at most 4 requests per second
+- **HTTP 429**: bazos rate-limits list pages per IP. Through a proxy a 429 is retried at once from another IP; without one it is retried after 30, 60, 120 and 240 seconds, and the delay between list pages doubles (up to 8 seconds)
 - **Error Handling**: Continues scraping even if individual pages fail
 
 ### **Robust Error Recovery**
