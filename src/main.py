@@ -86,6 +86,22 @@ def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# The Postgres `price` column is INTEGER; a bigger (joke) price can't be stored
+# and would fail the whole category's insert, so such values become None.
+_PRICE_MAX = 2_147_483_647
+
+
+def _slice_label(category: str, search_query: Optional[str]) -> str:
+    """Short name of what a run scrapes (e.g. "reality/byt"), for status reasons."""
+    return f"{category}/{search_query}" if search_query else category
+
+
+def _short_error(e: BaseException) -> str:
+    """One-line, bounded description of an error, for the run's status message."""
+    text = " ".join(str(e).split())
+    return f"{type(e).__name__}: {text}"[:200] if text else type(e).__name__
+
+
 # Bounded exponential backoff for transient fetch failures (timeouts, resets,
 # 429/5xx). A single flaky response used to abort an entire category scrape.
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
@@ -149,6 +165,10 @@ class BazosScraper:
         self.scraped_listings = set()
         # UTC instant to stop scraping by (set from the Apify timeout in main()).
         self.deadline: Optional[datetime] = None
+        # Why this run may have missed listings; any entry fails the run (main()).
+        self.incomplete_reasons: list[str] = []
+        # Detail pages that failed (those listings are still saved from their card).
+        self.detail_failures = 0
 
     def _past_deadline(self) -> bool:
         return self.deadline is not None and _now_utc() >= self.deadline
@@ -166,6 +186,7 @@ class BazosScraper:
         
         domain = CATEGORY_DOMAINS.get(category, "www.bazos.cz")
         base_url = f"https://{domain}"
+        label = _slice_label(category, search_query)
         
         listings = []
         page_offset = 0
@@ -180,6 +201,10 @@ class BazosScraper:
                     f"Run time budget reached while paging {category}; "
                     f"stopping at {len(listings)} listings"
                 )
+                self.incomplete_reasons.append(
+                    f"{label}: run time budget reached while paging "
+                    f"(stopped at {len(listings)} listings)"
+                )
                 break
 
             # Build URL with filters and pagination
@@ -191,15 +216,29 @@ class BazosScraper:
             
             try:
                 response = await _request_with_retry(self.client, "GET", url, follow_redirects=True)
-                response.raise_for_status()
                 soup = BeautifulSoup(response.content, 'lxml')
+
+                # Checked before raise_for_status(): bazos serves a page past the
+                # last result as a 404 that still renders the list header.
+                if self._is_end_of_results(soup):
+                    Actor.log.info(f"No more listings found for category {category} on page {page_number}")
+                    break
+
+                response.raise_for_status()
                 
                 # Extract listings from current page
                 page_listings = self._extract_listings_from_page(soup, category, base_url)
                 
-                if not page_listings:
-                    Actor.log.info(f"No more listings found for category {category} on page {page_number}")
+                if not page_listings and not soup.find('div', class_='inzeraty inzeratyflex'):
+                    # Not bazos's end-of-results page, so this is a block/consent
+                    # page or a layout change, not the end of the list.
+                    Actor.log.error(f"No parsable listings on {url}")
+                    self.incomplete_reasons.append(
+                        f"{label}: page {page_number} had no parsable listings"
+                    )
                     break
+                # (Cards that were all collected already — the list shifted while
+                # paging — just yield nothing new; carry on to the next page.)
                     
                 listings.extend(page_listings)
                 total_pages_scraped += 1
@@ -226,9 +265,15 @@ class BazosScraper:
                 
             except HTTPStatusError as e:
                 Actor.log.error(f"HTTP error while scraping {url}: {e}")
+                self.incomplete_reasons.append(
+                    f"{label}: page {page_number} returned HTTP {e.response.status_code}"
+                )
                 break
             except Exception as e:
                 Actor.log.error(f"Error while scraping {url}: {e}")
+                self.incomplete_reasons.append(
+                    f"{label}: page {page_number} failed ({_short_error(e)})"
+                )
                 break
                 
         Actor.log.info(f"Scraped {len(listings)} listings from category {category} across {total_pages_scraped} pages")
@@ -322,9 +367,9 @@ class BazosScraper:
         price_text = price_div.get_text(strip=True) if price_div else ""
         price = self._extract_price(price_text)
         
-        # Location
+        # Location ("Brno<br>625 00" -> "Brno 625 00")
         location_div = container.find('div', class_='inzeratylok')
-        location = location_div.get_text(strip=True) if location_div else ""
+        location = location_div.get_text(' ', strip=True) if location_div else ""
         
         # Views
         views_div = container.find('div', class_='inzeratyview')
@@ -371,6 +416,7 @@ class BazosScraper:
             return detailed_listing
             
         except Exception as e:
+            self.detail_failures += 1
             Actor.log.warning(f"Error scraping detailed data for {listing['url']}: {e}")
             return listing
     
@@ -387,8 +433,14 @@ class BazosScraper:
         # Contact information
         contact_table = soup.find('table', width="100%")
         if contact_table:
-            # Extract contact name
-            name_cell = contact_table.find('td', string=re.compile(r'Jméno:'))
+            # Extract contact name. The label cell is "Jméno:<br/><br/>" (so
+            # td.string is None); match its text instead, skipping the outer cell
+            # that wraps the nested contact table (its text starts with it too).
+            name_cell = contact_table.find(
+                lambda tag: tag.name == 'td'
+                and tag.find('td') is None
+                and tag.get_text(strip=True).startswith('Jméno')
+            )
             if name_cell and name_cell.find_next_sibling('td'):
                 contact_name = name_cell.find_next_sibling('td').get_text(strip=True)
                 details['contact_name'] = contact_name
@@ -447,7 +499,8 @@ class BazosScraper:
         price_match = re.search(r'([\d\s]+)', price_text.replace(' ', ''))
         if price_match:
             try:
-                return int(price_match.group(1).replace(' ', ''))
+                price = int(price_match.group(1).replace(' ', ''))
+                return price if price <= _PRICE_MAX else None
             except ValueError:
                 pass
         return None
@@ -472,6 +525,24 @@ class BazosScraper:
                 'longitude': float(coord_match.group(2))
             }
         return None
+    
+    def _is_end_of_results(self, soup: BeautifulSoup) -> bool:
+        """True if this is bazos's own "nothing (more) to show" list page.
+
+        An empty search says "Žádný inzerát nenalezen"; a page past the last
+        result (served as 404) says e.g. "Zobrazeno 821-806 inzerátů z 806".
+        Any other page without listings (block page, layout change) is not.
+        """
+        if soup.find('div', class_='inzeraty inzeratyflex'):
+            return False
+        header = soup.find('div', class_='listainzerat')
+        if not header:
+            return False
+        text = header.get_text(' ', strip=True)
+        if 'Žádný inzerát nenalezen' in text:
+            return True
+        match = re.search(r'Zobrazeno\s+(\d+)\s*-\s*\d+\s+\w+\s+z\s+(\d[\d\s]*)', text)
+        return bool(match) and int(match.group(1)) > int(re.sub(r'\D', '', match.group(2)))
     
     def _check_next_page(self, soup: BeautifulSoup, current_offset: int) -> tuple[bool, int]:
         """Enhanced method to check for next page and return next offset."""
@@ -603,15 +674,23 @@ async def main() -> None:
 
             all_listings = []
             total_pages_scraped = 0
+            saved_count = 0  # rows actually inserted into the database
+            # Shared with the scraper, which adds its paging failures here.
+            incomplete_reasons = scraper.incomplete_reasons
             
             # Scrape each category
             for category_index, category in enumerate(categories):
                 if scraper._past_deadline():
                     Actor.log.warning("Run time budget reached; stopping before remaining categories")
+                    incomplete_reasons.append(
+                        f"run time budget reached; skipped categories: "
+                        f"{', '.join(categories[category_index:])}"
+                    )
                     break
                 if category not in CATEGORY_DOMAINS:
                     Actor.log.warning(f"Unknown category: {category}, skipping")
                     continue
+                label = _slice_label(category, search_query)
                 
                 try:
                     Actor.log.info(f"=== Starting category: {category} ===")
@@ -649,11 +728,17 @@ async def main() -> None:
                             # Keep the rest card-only if the budget runs out
                             # mid-category, so what we already have still saves.
                             if scraper._past_deadline():
+                                skipped = len(category_listings) - len(detailed_listings)
                                 Actor.log.warning(
                                     f"Run time budget reached mid-detail; keeping "
                                     f"{len(detailed_listings)} enriched + "
-                                    f"{len(category_listings) - len(detailed_listings)} card-only"
+                                    f"{skipped} card-only"
                                 )
+                                if skipped:
+                                    incomplete_reasons.append(
+                                        f"{label}: run time budget reached; {skipped} "
+                                        f"listings saved without detail data"
+                                    )
                                 detailed_listings.extend(category_listings[len(detailed_listings):])
                                 break
 
@@ -676,6 +761,7 @@ async def main() -> None:
                                 # Check connection health before inserting
                                 Actor.log.debug("Inserting listings to database...")
                                 db_manager.insert_listings(category_listings)
+                                saved_count += len(category_listings)
                                 Actor.log.info(f"Saved {len(category_listings)} listings to database from category {category}")
                             except Exception as e:
                                 Actor.log.error(f"Failed to save listings to database: {e}")
@@ -684,38 +770,61 @@ async def main() -> None:
                                     Actor.log.info("Attempting to refresh connection pool and retry database operation")
                                     db_manager.refresh_pool()
                                     db_manager.insert_listings(category_listings)
+                                    saved_count += len(category_listings)
                                     Actor.log.info(f"Successfully saved {len(category_listings)} listings to database after retry")
                                 except Exception as retry_e:
                                     Actor.log.error(f"Failed to save listings to database even after retry: {retry_e}")
+                                    incomplete_reasons.append(
+                                        f"{label}: database save failed after retry ({_short_error(retry_e)})"
+                                    )
                     
                     Actor.log.info(f"=== Completed category: {category} ===")
                     
                 except Exception as e:
                     Actor.log.error(f"Error scraping category {category}: {e}")
+                    incomplete_reasons.append(f"{label}: category failed ({_short_error(e)})")
                     continue
             
             # Final summary and database cleanup
             Actor.log.info(f"=== SCRAPING COMPLETED ===")
             Actor.log.info(f"Total listings scraped: {len(all_listings)}")
+            Actor.log.info(f"Listings saved to database: {saved_count}")
             Actor.log.info(f"Categories processed: {len(categories)}")
+            if include_detailed_data:
+                Actor.log.info(f"Detail pages failed (saved from their card): {scraper.detail_failures}")
             
             # Zero listings almost always means upstream breakage (site change,
             # consent wall, block) rather than an empty market — mark the run
             # 'failed' so sold-detection ignores it instead of flagging every
-            # previously-seen listing as sold.
-            run_status = 'completed' if all_listings else 'failed'
+            # previously-seen listing as sold. A run that stopped early is
+            # 'failed' for the same reason: every listing it didn't reach would
+            # otherwise look sold.
+            run_status = 'failed' if incomplete_reasons or not saved_count else 'completed'
+            for reason in incomplete_reasons:
+                Actor.log.error(f"Run incomplete — {reason}")
 
             # Update actor run status in database
             if db_manager_available:
                 try:
-                    db_manager.update_actor_run_status(run_status, len(all_listings))
+                    db_manager.update_actor_run_status(run_status, saved_count)
                     db_manager.close_pool()
                     Actor.log.info("Database connection closed successfully")
                 except Exception as e:
                     Actor.log.error(f"Failed to update actor run status: {e}")
             
-            # Set status message
-            await Actor.set_status_message(f"Completed: {len(all_listings)} listings scraped from {len(categories)} categories")
+            # Set status message (an API call on the platform, so it must never
+            # break the run after the DB status has been written)
+            if incomplete_reasons:
+                more = f" (+{len(incomplete_reasons) - 1} more)" if len(incomplete_reasons) > 1 else ""
+                status_message = f"Stopped early: {incomplete_reasons[0]}{more}"
+            elif not saved_count:
+                status_message = f"Failed: no listings saved to the database ({len(all_listings)} scraped)"
+            else:
+                status_message = f"Completed: {len(all_listings)} listings scraped from {len(categories)} categories"
+            try:
+                await Actor.set_status_message(status_message)
+            except Exception as e:
+                Actor.log.warning(f"Could not set the run's status message: {e}")
 
 
 if __name__ == '__main__':
