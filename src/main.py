@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import os
 import asyncio
+import copy
+import math
 import re
 import sys
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 from datetime import datetime, timedelta, timezone
@@ -90,10 +93,67 @@ def _now_utc() -> datetime:
 # and would fail the whole category's insert, so such values become None.
 _PRICE_MAX = 2_147_483_647
 
+# Detail pages are fetched DETAIL_CONCURRENCY at a time, their requests starting at
+# least DETAIL_MIN_INTERVAL_SECS apart (<= 4 requests/s). One by one, with a 0.5 s
+# pause each, an uncapped search (byt: ~16,000 listings) would outlast the run.
+DETAIL_CONCURRENCY = 4
+DETAIL_MIN_INTERVAL_SECS = 0.25
+
+# More failed detail pages than this share AND count of a category's fetches means
+# a block or an outage, not the odd listing deleted since paging (HTTP 410): the run
+# is then incomplete, so its card-only rows (no coordinates) don't replace good data.
+DETAIL_FAILURE_SHARE_LIMIT = 0.02
+DETAIL_FAILURE_COUNT_LIMIT = 20
+
+# bazos serves at most this many results for one search URL: the page at offset
+# 20,000 is a 404 that re-serves the last cards ("Zobrazeno 19981-20000 ... z N").
+SITE_RESULT_LIMIT = 20_000
+# A search reporting more results than this is split into smaller searches (see
+# BazosScraper._scrape_search); the margin absorbs listings added while paging.
+SPLIT_THRESHOLD = 19_500
+# Most searches (page-1 fetches) one category may spend on splitting.
+MAX_SPLIT_SEARCHES = 200
+# How far the subcategories' result counts may fall short of the whole search's
+# (listings removed between those page-1 fetches) before the split counts as
+# leaving listings out.
+_SPLIT_COVERAGE_SLACK = 5
+
+# Results header of a list page, e.g. "Zobrazeno 21-40 inzerátů z 15 829".
+_RESULTS_RE = re.compile(r'Zobrazeno\s+(\d+)\s*-\s*\d+\s+\w+\s+z\s+(\d[\d\s]*)')
+
 
 def _slice_label(category: str, search_query: Optional[str]) -> str:
     """Short name of what a run scrapes (e.g. "reality/byt"), for status reasons."""
     return f"{category}/{search_query}" if search_query else category
+
+
+def _price_range_text(lo: int, hi: Optional[int]) -> str:
+    return f"{lo}+ Kč" if hi is None else f"{lo}-{hi} Kč"
+
+
+def _price_split_point(lo: int, hi: Optional[int]) -> Optional[int]:
+    """Price to cut the band [lo, hi] at: [lo, cut] + [cut + 1, hi] (None: can't).
+
+    The geometric middle, as prices span orders of magnitude (rents in thousands,
+    sales in millions); an open band is cut below _PRICE_MAX.
+    """
+    top = _PRICE_MAX if hi is None else hi
+    if top <= lo:
+        return None
+    return min(max(lo, math.isqrt(lo * top)), top - 1)
+
+
+def _multiline_text(element) -> str:
+    """An element's text as a browser shows it: each <br> breaks the line, while
+    whitespace in the HTML source (like the newline after every <br/>) is a space."""
+    element = copy.copy(element)  # leave the parsed page untouched
+    for br in element.find_all('br'):
+        br.replace_with('\x00')
+    lines = [
+        re.sub(r'[ \t\r\n\f]+', ' ', part).strip(' ')
+        for part in element.get_text().split('\x00')
+    ]
+    return re.sub(r'\n{3,}', '\n\n', '\n'.join(lines)).strip('\n')
 
 
 def _short_error(e: BaseException) -> str:
@@ -107,22 +167,27 @@ def _short_error(e: BaseException) -> str:
 _RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
-async def _request_with_retry(client, method, url, attempts=3, **kwargs):
+async def _request_with_retry(client, method, url, attempts=3, give_up=None, **kwargs):
     """Issue a request, retrying transient failures with exponential backoff.
 
     Returns the final response without raising for status (callers keep their
     own raise_for_status()); re-raises the last transport error if the
-    connection itself keeps failing.
+    connection itself keeps failing. No retry once `give_up()` is true (the
+    run's time budget is spent: the margin is for saving, not for retries).
     """
     for attempt in range(1, attempts + 1):
         try:
             response = await client.request(method, url, **kwargs)
         except TransportError as e:
-            if attempt == attempts:
+            if attempt == attempts or (give_up is not None and give_up()):
                 raise
             reason = repr(e)
         else:
-            if response.status_code not in _RETRYABLE_STATUS or attempt == attempts:
+            if (
+                response.status_code not in _RETRYABLE_STATUS
+                or attempt == attempts
+                or (give_up is not None and give_up())
+            ):
                 return response
             reason = f"HTTP {response.status_code}"
         delay = 2.0 * (2 ** (attempt - 1))
@@ -157,6 +222,32 @@ class _FailRunOnCrash:
         return False
 
 
+@dataclass
+class _Search:
+    """One category's search as configured, and the listings collected for it."""
+    category: str
+    base_url: str
+    label: str
+    query: Optional[str]
+    location: Optional[str]
+    price_min: Optional[int]
+    price_max: Optional[int]
+    max_listings: int
+    listings: List[Dict[str, Any]] = field(default_factory=list)
+
+    def capped(self) -> bool:
+        return self.max_listings > 0 and len(self.listings) >= self.max_listings
+
+
+@dataclass
+class _Paged:
+    """How paging one search URL went."""
+    total: Optional[int] = None  # result count its first page reported
+    # (response, soup) of page 1 when it stopped there to have the search split
+    first_page: Optional[tuple] = None
+    at_site_limit: bool = False  # stopped where bazos stops serving results
+
+
 class BazosScraper:
     """Main scraper class for Bazos.cz listings with enhanced pagination."""
 
@@ -169,12 +260,18 @@ class BazosScraper:
         self.incomplete_reasons: list[str] = []
         # Detail pages that failed (those listings are still saved from their card).
         self.detail_failures = 0
+        self._last_detail_error = ""
+        # Event-loop time the next detail request may start (see DETAIL_*).
+        self._next_detail_start = 0.0
+        # Per category: list pages scraped, and searches left for splitting.
+        self._pages_scraped = 0
+        self._split_searches_left = MAX_SPLIT_SEARCHES
 
     def _past_deadline(self) -> bool:
         return self.deadline is not None and _now_utc() >= self.deadline
 
     async def scrape_category_listings(
-        self, 
+        self,
         category: str,
         max_listings: int = 0,
         search_query: Optional[str] = None,
@@ -182,103 +279,296 @@ class BazosScraper:
         price_min: Optional[int] = None,
         price_max: Optional[int] = None
     ) -> List[Dict[str, Any]]:
-        """Scrape listings from a specific category with full pagination support."""
-        
+        """Scrape a category's search results, every page of them (0 = no cap)."""
+
         domain = CATEGORY_DOMAINS.get(category, "www.bazos.cz")
-        base_url = f"https://{domain}"
-        label = _slice_label(category, search_query)
-        
-        listings = []
+        search = _Search(
+            category=category,
+            base_url=f"https://{domain}",
+            label=_slice_label(category, search_query),
+            query=search_query,
+            location=location,
+            price_min=price_min or None,
+            price_max=price_max or None,
+            max_listings=max_listings,
+        )
+        self._pages_scraped = 0
+        self._split_searches_left = MAX_SPLIT_SEARCHES
+
+        Actor.log.info(f"Starting to scrape category: {category}")
+        await self._scrape_search(search, '/', search.price_min, search.price_max)
+        Actor.log.info(
+            f"Scraped {len(search.listings)} listings from category {category} "
+            f"across {self._pages_scraped} pages"
+        )
+        return search.listings
+
+    async def _scrape_search(
+        self, search: _Search, path: str, lo: Optional[int], hi: Optional[int]
+    ) -> None:
+        """Scrape one search: a subcategory `path` and price band [lo, hi] of `search`.
+
+        bazos serves only the first SITE_RESULT_LIMIT results of a search, so one
+        that reports more (on its page 1) is split instead of paged: into its
+        subcategories ("/prodam/byt/", ...), which partition it including the
+        listings without a price ("Dohodou", "V textu") that no price filter or
+        price sort ever returns; or, if it is price-filtered anyway, into two price
+        bands. One that can't be split is scraped as far as bazos serves it and the
+        run is recorded as incomplete.
+        """
+        name = self._search_name(search, path, lo, hi)
+        self._split_searches_left -= 1
+        may_split = self._split_searches_left > 0 and (
+            search.max_listings == 0
+            or search.max_listings - len(search.listings) > SPLIT_THRESHOLD
+        )
+        paged = await self._scrape_pages(
+            search, path, lo, hi, name,
+            split_above=SPLIT_THRESHOLD if may_split else None,
+        )
+        if paged.first_page is None:
+            if paged.at_site_limit:
+                self.incomplete_reasons.append(
+                    f"{name}: more than {SITE_RESULT_LIMIT} results; bazos serves "
+                    f"no more (stopped at offset {SITE_RESULT_LIMIT})"
+                )
+            return
+
+        subpaths = self._subcategory_paths(paged.first_page[1]) if path == '/' else []
+        if subpaths:
+            await self._split_by_subcategory(search, subpaths, lo, hi, name, paged.total)
+            return
+        if lo is not None or hi is not None:
+            cut = _price_split_point(lo or 1, hi)
+            if cut is not None:
+                await self._split_by_price(search, path, lo or 1, cut, hi, name)
+                return
+        self.incomplete_reasons.append(
+            f"{name}: {paged.total} results and no way to split them; bazos serves "
+            f"only the newest {SITE_RESULT_LIMIT} of a search"
+        )
+        await self._scrape_pages(search, path, lo, hi, name, first_page=paged.first_page)
+
+    async def _split_by_subcategory(
+        self,
+        search: _Search,
+        subpaths: List[str],
+        lo: Optional[int],
+        hi: Optional[int],
+        name: str,
+        total: Optional[int],
+    ) -> None:
+        """Scrape a too-big search subcategory by subcategory.
+
+        First reads every subcategory's result count, so a partition that misses
+        listings (they add up to less than the whole) is caught.
+        """
+        Actor.log.info(
+            f"{name}: {total} results, more than bazos serves for one search; "
+            f"splitting it into {len(subpaths)} subcategories"
+        )
+        totals: Dict[str, Optional[int]] = {}
+        for sub in subpaths:
+            if self._past_deadline():
+                self.incomplete_reasons.append(
+                    f"{name}: run time budget reached while splitting it by subcategory"
+                )
+                return
+            await asyncio.sleep(1)
+            self._split_searches_left -= 1
+            totals[sub] = await self._probe_total(search, sub, lo, hi)
+        covered = sum(t for t in totals.values() if t)
+        Actor.log.info(f"{name}: subcategories hold {covered} of {total} results")
+        if total is not None and covered + _SPLIT_COVERAGE_SLACK < total:
+            self.incomplete_reasons.append(
+                f"{name}: its subcategories hold only {covered} of its {total} results"
+            )
+        todo = [sub for sub, t in totals.items() if t != 0]  # None: count unknown
+        for i, sub in enumerate(todo):
+            if search.capped():
+                break
+            if self._past_deadline():
+                self.incomplete_reasons.append(
+                    f"{name}: run time budget reached; {len(todo) - i} of "
+                    f"{len(todo)} subcategories not scraped"
+                )
+                break
+            await asyncio.sleep(1)
+            await self._scrape_search(search, sub, lo, hi)
+
+    async def _split_by_price(
+        self, search: _Search, path: str, lo: int, cut: int, hi: Optional[int], name: str
+    ) -> None:
+        """Scrape a too-big price-filtered search as the bands [lo, cut] + [cut+1, hi].
+
+        (bazos's price bounds are inclusive. Listings without a price match no
+        price filter, so this split is only used where a price filter is set.)
+        """
+        Actor.log.info(
+            f"{name}: more results than bazos serves for one search; "
+            f"splitting it at {cut} Kč"
+        )
+        for band_lo, band_hi in ((lo, cut), (cut + 1, hi)):
+            if search.capped():
+                break
+            if self._past_deadline():
+                self.incomplete_reasons.append(
+                    f"{name}: run time budget reached; price band "
+                    f"{_price_range_text(band_lo, band_hi)} not scraped"
+                )
+                break
+            await asyncio.sleep(1)
+            await self._scrape_search(search, path, band_lo, band_hi)
+
+    async def _scrape_pages(
+        self,
+        search: _Search,
+        path: str,
+        lo: Optional[int],
+        hi: Optional[int],
+        name: str,
+        split_above: Optional[int] = None,
+        first_page: Optional[tuple] = None,
+    ) -> _Paged:
+        """Page one search URL, newest first, adding unseen listings to the search.
+
+        Stops after page 1 (keeping it in the result) if that reports more than
+        `split_above` results, and before the page where bazos stops serving
+        results; any early stop for another reason is an incomplete reason.
+        """
+        result = _Paged()
         page_offset = 0
         page_number = 1
-        total_pages_scraped = 0
-        
-        Actor.log.info(f"Starting to scrape category: {category}")
-        
+
         while True:
             if self._past_deadline():
                 Actor.log.warning(
-                    f"Run time budget reached while paging {category}; "
-                    f"stopping at {len(listings)} listings"
+                    f"Run time budget reached while paging {name}; "
+                    f"stopping at {len(search.listings)} listings"
                 )
                 self.incomplete_reasons.append(
-                    f"{label}: run time budget reached while paging "
-                    f"(stopped at {len(listings)} listings)"
+                    f"{name}: run time budget reached while paging "
+                    f"(stopped at {len(search.listings)} listings)"
                 )
                 break
 
-            # Build URL with filters and pagination
             url = self._build_search_url(
-                base_url, page_offset, search_query, location, price_min, price_max
+                search.base_url, page_offset, search.query, search.location, lo, hi,
+                path=path,
             )
-            
-            Actor.log.info(f"Scraping page {page_number} (offset {page_offset}): {url}")
-            
+
             try:
-                response = await _request_with_retry(self.client, "GET", url, follow_redirects=True)
-                soup = BeautifulSoup(response.content, 'lxml')
+                if first_page is not None:
+                    response, soup = first_page
+                    first_page = None
+                else:
+                    Actor.log.info(f"Scraping page {page_number} (offset {page_offset}): {url}")
+                    response = await _request_with_retry(
+                        self.client, "GET", url, follow_redirects=True, give_up=self._past_deadline
+                    )
+                    soup = BeautifulSoup(response.content, 'lxml')
 
                 # Checked before raise_for_status(): bazos serves a page past the
                 # last result as a 404 that still renders the list header.
                 if self._is_end_of_results(soup):
-                    Actor.log.info(f"No more listings found for category {category} on page {page_number}")
+                    Actor.log.info(f"No more listings found for {name} on page {page_number}")
                     break
 
                 response.raise_for_status()
-                
-                # Extract listings from current page
-                page_listings = self._extract_listings_from_page(soup, category, base_url)
-                
+
+                if page_number == 1:
+                    result.total = self._reported_total(soup)
+                    if split_above is not None and (result.total or 0) > split_above:
+                        result.first_page = (response, soup)
+                        break
+
+                page_listings = self._extract_listings_from_page(soup, search.category, search.base_url)
+
                 if not page_listings and not soup.find('div', class_='inzeraty inzeratyflex'):
                     # Not bazos's end-of-results page, so this is a block/consent
                     # page or a layout change, not the end of the list.
                     Actor.log.error(f"No parsable listings on {url}")
                     self.incomplete_reasons.append(
-                        f"{label}: page {page_number} had no parsable listings"
+                        f"{name}: page {page_number} had no parsable listings"
                     )
                     break
                 # (Cards that were all collected already — the list shifted while
                 # paging — just yield nothing new; carry on to the next page.)
-                    
-                listings.extend(page_listings)
-                total_pages_scraped += 1
-                
-                Actor.log.info(f"Extracted {len(page_listings)} listings from page {page_number} (total so far: {len(listings)})")
-                
-                # Check if we've reached the maximum
-                if max_listings > 0 and len(listings) >= max_listings:
-                    listings = listings[:max_listings]
-                    Actor.log.info(f"Reached maximum listings limit ({max_listings}) after {total_pages_scraped} pages")
+
+                search.listings.extend(page_listings)
+                self._pages_scraped += 1
+
+                Actor.log.info(f"Extracted {len(page_listings)} listings from page {page_number} (total so far: {len(search.listings)})")
+
+                if search.capped():
+                    del search.listings[search.max_listings:]
+                    Actor.log.info(f"Reached maximum listings limit ({search.max_listings})")
                     break
-                    
-                # Check if there's a next page using multiple methods
+
                 has_next, next_offset = self._check_next_page(soup, page_offset)
                 if not has_next:
                     Actor.log.info(f"No next page found after page {page_number}")
                     break
-                    
+                if next_offset >= SITE_RESULT_LIMIT:
+                    result.at_site_limit = True
+                    break
+
                 page_offset = next_offset
                 page_number += 1
-                
+
                 # Rate limiting between pages
                 await asyncio.sleep(1)
-                
-            except HTTPStatusError as e:
-                Actor.log.error(f"HTTP error while scraping {url}: {e}")
-                self.incomplete_reasons.append(
-                    f"{label}: page {page_number} returned HTTP {e.response.status_code}"
-                )
-                break
+
             except Exception as e:
-                Actor.log.error(f"Error while scraping {url}: {e}")
-                self.incomplete_reasons.append(
-                    f"{label}: page {page_number} failed ({_short_error(e)})"
-                )
+                self._record_page_failure(name, page_number, url, e)
                 break
-                
-        Actor.log.info(f"Scraped {len(listings)} listings from category {category} across {total_pages_scraped} pages")
-        return listings
-    
+
+        return result
+
+    async def _probe_total(
+        self, search: _Search, path: str, lo: Optional[int], hi: Optional[int]
+    ) -> Optional[int]:
+        """Result count of a search's page 1 (0: no results; None: page failed)."""
+        name = self._search_name(search, path, lo, hi)
+        url = self._build_search_url(
+            search.base_url, 0, search.query, search.location, lo, hi, path=path
+        )
+        Actor.log.info(f"Reading the result count of {url}")
+        try:
+            response = await _request_with_retry(
+                self.client, "GET", url, follow_redirects=True, give_up=self._past_deadline
+            )
+            soup = BeautifulSoup(response.content, 'lxml')
+            if self._is_end_of_results(soup):
+                return 0
+            response.raise_for_status()
+        except Exception as e:
+            self._record_page_failure(name, 1, url, e)
+            return None
+        return self._reported_total(soup)
+
+    def _record_page_failure(self, name: str, page_number: int, url: str, e: Exception) -> None:
+        if isinstance(e, HTTPStatusError):
+            Actor.log.error(f"HTTP error while scraping {url}: {e}")
+            self.incomplete_reasons.append(
+                f"{name}: page {page_number} returned HTTP {e.response.status_code}"
+            )
+        else:
+            Actor.log.error(f"Error while scraping {url}: {e}")
+            self.incomplete_reasons.append(
+                f"{name}: page {page_number} failed ({_short_error(e)})"
+            )
+
+    @staticmethod
+    def _search_name(search: _Search, path: str, lo: Optional[int], hi: Optional[int]) -> str:
+        """`search`'s label, plus the subcategory / price band of a split part of it."""
+        parts = []
+        if path != '/':
+            parts.append(path.strip('/'))
+        if (lo, hi) != (search.price_min, search.price_max):
+            parts.append(_price_range_text(lo or 1, hi))
+        return f"{search.label} [{', '.join(parts)}]" if parts else search.label
+
     def _build_search_url(
         self,
         base_url: str,
@@ -286,17 +576,18 @@ class BazosScraper:
         search_query: Optional[str] = None,
         location: Optional[str] = None,
         price_min: Optional[int] = None,
-        price_max: Optional[int] = None
+        price_max: Optional[int] = None,
+        path: str = '/',
     ) -> str:
-        """Build search URL with filters and pagination."""
-        
+        """Build search URL with filters and pagination (`path`: a subcategory)."""
+
         if page_offset == 0:
-            url = f"{base_url}/"
+            url = f"{base_url}{path}"
         else:
-            url = f"{base_url}/{page_offset}/"
-            
+            url = f"{base_url}{path}{page_offset}/"
+
         params = []
-        
+
         if search_query:
             params.append(f"hledat={search_query}")
         if location:
@@ -305,10 +596,10 @@ class BazosScraper:
             params.append(f"cenaod={price_min}")
         if price_max:
             params.append(f"cenado={price_max}")
-            
+
         if params:
             url += "?" + "&".join(params)
-            
+
         return url
     
     def _extract_listings_from_page(self, soup: BeautifulSoup, category: str, base_url: str) -> List[Dict[str, Any]]:
@@ -398,37 +689,98 @@ class BazosScraper:
             'scraped_at': datetime.now().isoformat()
         }
     
+    async def scrape_details(self, label: str, listings: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Merge detail-page data into a category's listings, keeping their order.
+
+        Up to DETAIL_CONCURRENCY detail pages are in flight at once. Once the run's
+        time budget is spent the remaining listings keep their card data, so we
+        still save what we have, and the run is recorded as incomplete.
+        """
+        semaphore = asyncio.Semaphore(DETAIL_CONCURRENCY)
+        failures_before = self.detail_failures
+        done = 0
+        skipped = 0
+
+        async def enrich(listing: Dict[str, Any]) -> Dict[str, Any]:
+            nonlocal done, skipped
+            async with semaphore:
+                # Checked on both sides of the pacing wait: no request starts past
+                # the deadline, and the listings it cuts off wait for nothing.
+                if not self._past_deadline():
+                    await self._pace_detail_request()
+                if self._past_deadline():
+                    skipped += 1
+                    return listing
+                detailed = await self.scrape_detailed_data(listing)
+            done += 1
+            if done % 100 == 0:
+                Actor.log.info(f"Scraped detailed data for {done}/{len(listings)} listings")
+            return detailed
+
+        detailed_listings = list(await asyncio.gather(*(enrich(item) for item in listings)))
+
+        if skipped:
+            Actor.log.warning(
+                f"Run time budget reached mid-detail; keeping "
+                f"{len(listings) - skipped} enriched + {skipped} card-only"
+            )
+            self.incomplete_reasons.append(
+                f"{label}: run time budget reached; {skipped} listings saved "
+                f"without detail data"
+            )
+        failed = self.detail_failures - failures_before
+        fetched = len(listings) - skipped
+        if failed > DETAIL_FAILURE_COUNT_LIMIT and failed > DETAIL_FAILURE_SHARE_LIMIT * fetched:
+            self.incomplete_reasons.append(
+                f"{label}: {failed} of {fetched} detail pages failed (last: "
+                f"{self._last_detail_error}); saved without detail data"
+            )
+        return detailed_listings
+
+    async def _pace_detail_request(self) -> None:
+        """Wait for this detail request's start slot, DETAIL_MIN_INTERVAL_SECS apart."""
+        loop = asyncio.get_running_loop()
+        start = max(loop.time(), self._next_detail_start)
+        self._next_detail_start = start + DETAIL_MIN_INTERVAL_SECS
+        await asyncio.sleep(start - loop.time())
+
     async def scrape_detailed_data(self, listing: Dict[str, Any]) -> Dict[str, Any]:
-        """Scrape detailed data from individual listing page."""
-        
+        """Fetch one listing's detail page (retrying transient failures) and merge it.
+
+        If it still fails (e.g. HTTP 410: deleted since it was paged) the listing
+        keeps its card data and the failure is counted.
+        """
         try:
-            response = await self.client.get(listing['url'], follow_redirects=True)
+            response = await _request_with_retry(
+                self.client, "GET", listing['url'], follow_redirects=True,
+                give_up=self._past_deadline,
+            )
             response.raise_for_status()
-            soup = BeautifulSoup(response.content, 'lxml')
-            
-            # Extract additional details
-            details = self._extract_detailed_data(soup)
-            
-            # Merge with existing listing data
-            detailed_listing = {**listing, **details}
-            
-            Actor.log.debug(f"Scraped detailed data for listing {listing['id']}")
-            return detailed_listing
-            
+            details = self._extract_detailed_data(BeautifulSoup(response.content, 'lxml'))
+            if not details:
+                # A block or error page served as 200, not a listing.
+                raise ValueError("no listing data on the detail page")
         except Exception as e:
             self.detail_failures += 1
+            self._last_detail_error = (
+                f"HTTP {e.response.status_code}" if isinstance(e, HTTPStatusError)
+                else _short_error(e)
+            )
             Actor.log.warning(f"Error scraping detailed data for {listing['url']}: {e}")
             return listing
-    
+
+        Actor.log.debug(f"Scraped detailed data for listing {listing['id']}")
+        return {**listing, **details}
+
     def _extract_detailed_data(self, soup: BeautifulSoup) -> Dict[str, Any]:
         """Extract detailed information from listing page."""
-        
+
         details = {}
-        
-        # Full description
+
+        # Full description, line breaks kept ("…řádek.<br/>\nDalší…")
         desc_div = soup.find('div', class_='popisdetail')
         if desc_div:
-            details['full_description'] = desc_div.get_text(strip=True)
+            details['full_description'] = _multiline_text(desc_div)
         
         # Contact information
         contact_table = soup.find('table', width="100%")
@@ -470,15 +822,23 @@ class BazosScraper:
                     images.append(img_url)
             details['images'] = images
         
-        # Similar/related listings
+        # Similar/related listings. A card's first link wraps just its image; the
+        # title link is the one in .nadpis.
         similar_section = soup.find('div', class_='podobne')
         if similar_section:
             similar_listings = []
             for listing_div in similar_section.find_all('div', class_='inzeraty inzeratyflex'):
-                similar_title_link = listing_div.find('a')
+                title_box = listing_div.find(class_='nadpis')
+                similar_title_link = (
+                    title_box.find('a', href=True) if title_box else None
+                ) or listing_div.find('a', href=True)
                 if similar_title_link:
+                    title = similar_title_link.get_text(strip=True)
+                    if not title:
+                        img = listing_div.find('img', alt=True)
+                        title = img['alt'].strip() if img else ''
                     similar_listings.append({
-                        'title': similar_title_link.get_text(strip=True),
+                        'title': title,
                         'url': similar_title_link.get('href')
                     })
             details['similar_listings'] = similar_listings
@@ -541,9 +901,28 @@ class BazosScraper:
         text = header.get_text(' ', strip=True)
         if 'Žádný inzerát nenalezen' in text:
             return True
-        match = re.search(r'Zobrazeno\s+(\d+)\s*-\s*\d+\s+\w+\s+z\s+(\d[\d\s]*)', text)
+        match = _RESULTS_RE.search(text)
         return bool(match) and int(match.group(1)) > int(re.sub(r'\D', '', match.group(2)))
-    
+
+    def _reported_total(self, soup: BeautifulSoup) -> Optional[int]:
+        """Result count from a list page's header ("Zobrazeno 1-20 inzerátů z 15 829")."""
+        header = soup.find('div', class_='listainzerat')
+        match = _RESULTS_RE.search(header.get_text(' ', strip=True)) if header else None
+        return int(re.sub(r'\D', '', match.group(2))) if match else None
+
+    def _subcategory_paths(self, soup: BeautifulSoup) -> List[str]:
+        """The category's subcategories ("/prodam/byt/", ...) from a list page's menu.
+
+        Same-site links only: a menu entry that points at another bazos section
+        (e.g. "Ubytování" -> sluzby.bazos.cz) is a different category.
+        """
+        paths: List[str] = []
+        for link in soup.select('div.menuleft div.barvaleva a[href]'):
+            href = link['href']
+            if re.fullmatch(r'(?:/[\w-]+)+/', href) and href not in paths:
+                paths.append(href)
+        return paths
+
     def _check_next_page(self, soup: BeautifulSoup, current_offset: int) -> tuple[bool, int]:
         """Enhanced method to check for next page and return next offset."""
         
@@ -577,18 +956,12 @@ class BazosScraper:
             next_offset = current_offset + 20
             return True, next_offset
         
-        # Method 3: Check for "Zobrazeno X-Y inzerátů z Z" pattern
-        listainzerat = soup.find('div', class_='listainzerat inzeratyflex')
-        if listainzerat:
-            text = listainzerat.get_text()
-            # Look for pattern like "Zobrazeno 1-20 inzerátů z 421474"
-            match = re.search(r'Zobrazeno \d+-\d+ inzerátů z (\d+)', text)
-            if match:
-                total_listings = int(match.group(1))
-                current_end = current_offset + 20
-                if current_end < total_listings:
-                    return True, current_offset + 20
-        
+        # Method 3: the "Zobrazeno 1-20 inzerátů z 15 829" header (the total has
+        # thousands separators)
+        total_listings = self._reported_total(soup)
+        if total_listings is not None and current_offset + 20 < total_listings:
+            return True, current_offset + 20
+
         return False, current_offset
 
 
@@ -712,40 +1085,11 @@ async def main() -> None:
                         price_max=price_max
                     )
                     
-                    # Scrape detailed data if requested
+                    # Scrape detailed data if requested (coordinates come only
+                    # from the detail page)
                     if include_detailed_data and category_listings:
                         Actor.log.info(f"Scraping detailed data for {len(category_listings)} listings from {category}")
-                        
-                        detailed_listings = []
-                        for i, listing in enumerate(category_listings):
-                            detailed_listing = await scraper.scrape_detailed_data(listing)
-                            detailed_listings.append(detailed_listing)
-                            
-                            # Progress update
-                            if (i + 1) % 10 == 0:
-                                Actor.log.info(f"Scraped detailed data for {i + 1}/{len(category_listings)} listings")
-
-                            # Keep the rest card-only if the budget runs out
-                            # mid-category, so what we already have still saves.
-                            if scraper._past_deadline():
-                                skipped = len(category_listings) - len(detailed_listings)
-                                Actor.log.warning(
-                                    f"Run time budget reached mid-detail; keeping "
-                                    f"{len(detailed_listings)} enriched + "
-                                    f"{skipped} card-only"
-                                )
-                                if skipped:
-                                    incomplete_reasons.append(
-                                        f"{label}: run time budget reached; {skipped} "
-                                        f"listings saved without detail data"
-                                    )
-                                detailed_listings.extend(category_listings[len(detailed_listings):])
-                                break
-
-                            # Rate limiting for detailed scraping
-                            await asyncio.sleep(0.5)
-                        
-                        category_listings = detailed_listings
+                        category_listings = await scraper.scrape_details(label, category_listings)
                     
                     all_listings.extend(category_listings)
                     
