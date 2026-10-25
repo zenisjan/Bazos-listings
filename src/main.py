@@ -111,7 +111,8 @@ SITE_RESULT_LIMIT = 20_000
 # A search reporting more results than this is split into smaller searches (see
 # BazosScraper._scrape_search); the margin absorbs listings added while paging.
 SPLIT_THRESHOLD = 19_500
-# Most searches (page-1 fetches) one category may spend on splitting.
+# Most searches (page-1 fetches) one top-level search may spend on splitting: a
+# category's root search, or each of the subcategories it is scraped by instead.
 MAX_SPLIT_SEARCHES = 200
 # How far the subcategories' result counts may fall short of the whole search's
 # (listings removed between those page-1 fetches) before the split counts as
@@ -125,6 +126,61 @@ _RESULTS_RE = re.compile(r'Zobrazeno\s+(\d+)\s*-\s*\d+\s+\w+\s+z\s+(\d[\d\s]*)')
 def _slice_label(category: str, search_query: Optional[str]) -> str:
     """Short name of what a run scrapes (e.g. "reality/byt"), for status reasons."""
     return f"{category}/{search_query}" if search_query else category
+
+
+# A `subcategories` entry is a path on its category's site: "skoda" for
+# auto.bazos.cz/skoda/, "prodam/byt" for reality.bazos.cz/prodam/byt/.
+_SUBCATEGORY_RE = re.compile(r'[a-z0-9_-]+(?:/[a-z0-9_-]+)*')
+
+
+def _parse_subcategories(value: Any) -> tuple[List[str], List[str]]:
+    """The `subcategories` input as unique paths ("skoda", "prodam/byt"), plus the
+    entries that can't be a bazos path (they are skipped, which fails the run)."""
+    if isinstance(value, str):
+        value = value.split(',')
+    paths: List[str] = []
+    invalid: List[str] = []
+    for entry in value or []:
+        if entry is None:
+            continue
+        path = str(entry).strip().strip('/').lower()
+        if not path:
+            continue
+        if not _SUBCATEGORY_RE.fullmatch(path):
+            invalid.append(str(entry))
+        elif path not in paths:
+            paths.append(path)
+    return paths, invalid
+
+
+def _radius_km(value: Any) -> Optional[int]:
+    """The `radius` input in whole km (None: not set); a bad value fails the run."""
+    if value is None or value == '':
+        return None
+    if not isinstance(value, bool):
+        try:
+            if float(value) == int(value) >= 1:
+                return int(value)
+        except (TypeError, ValueError, OverflowError):
+            pass
+    raise ValueError(f"radius must be a whole number of km, at least 1 (got {value!r})")
+
+
+def _location_filter(
+    location: Optional[str], radius: Optional[int], label: Optional[str]
+) -> Optional[str]:
+    """What the run stores as actor_runs.location_filter.
+
+    The app's sold detection treats runs with the same (scraper_name, search_query,
+    location_filter) as one slice: a listing missing from the slice's latest
+    completed run counts as sold. So each regional row needs its own value: its
+    `locationLabel`, else e.g. "60200 +50 km", else the plain location.
+    """
+    if label:
+        return label
+    if location and radius:
+        return f"{location} +{radius} km"
+    return location
 
 
 def _price_range_text(lo: int, hi: Optional[int]) -> str:
@@ -215,11 +271,22 @@ class _FailRunOnCrash:
         if exc_type is not None:
             try:
                 Actor.log.error(f"Run failed with unhandled error: {exc!r}")
-                db_manager.update_actor_run_status("failed", 0)
+                # A run that died before creating its row (e.g. no database on
+                # the platform) has none to mark; trying would only reconnect.
+                if db_manager.actor_run_id is not None:
+                    db_manager.update_actor_run_status("failed", 0)
                 db_manager.close_pool()
             except Exception as finalize_error:
                 Actor.log.error(f"Could not mark run failed: {finalize_error}")
         return False
+
+
+class _RedirectedAway(Exception):
+    """bazos answered a list page from another site or path (see _check_landed)."""
+
+    def __init__(self, url, subcategory: bool):
+        hint = " (no such subcategory?)" if subcategory else ""
+        super().__init__(f"redirected to {url}{hint}")
 
 
 @dataclass
@@ -233,6 +300,7 @@ class _Search:
     price_min: Optional[int]
     price_max: Optional[int]
     max_listings: int
+    radius: Optional[int] = None  # km around `location` (bazos's humkreis)
     listings: List[Dict[str, Any]] = field(default_factory=list)
 
     def capped(self) -> bool:
@@ -277,9 +345,16 @@ class BazosScraper:
         search_query: Optional[str] = None,
         location: Optional[str] = None,
         price_min: Optional[int] = None,
-        price_max: Optional[int] = None
+        price_max: Optional[int] = None,
+        radius: Optional[int] = None,
+        subcategories: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
-        """Scrape a category's search results, every page of them (0 = no cap)."""
+        """Scrape a category's search results, every page of them (0 = no cap).
+
+        With `subcategories` ("skoda", ...) the category is searched one
+        subcategory at a time (auto.bazos.cz/skoda/, ...) instead of at its root;
+        `max_listings` then caps their total.
+        """
 
         domain = CATEGORY_DOMAINS.get(category, "www.bazos.cz")
         search = _Search(
@@ -291,21 +366,54 @@ class BazosScraper:
             price_min=price_min or None,
             price_max=price_max or None,
             max_listings=max_listings,
+            radius=radius if location else None,
         )
         self._pages_scraped = 0
-        self._split_searches_left = MAX_SPLIT_SEARCHES
 
         Actor.log.info(f"Starting to scrape category: {category}")
-        await self._scrape_search(search, '/', search.price_min, search.price_max)
+        if subcategories:
+            await self._scrape_subcategories(search, subcategories)
+        else:
+            self._split_searches_left = MAX_SPLIT_SEARCHES
+            await self._scrape_search(search, '/', search.price_min, search.price_max)
         Actor.log.info(
             f"Scraped {len(search.listings)} listings from category {category} "
             f"across {self._pages_scraped} pages"
         )
         return search.listings
 
+    async def _scrape_subcategories(self, search: _Search, subcategories: List[str]) -> None:
+        """Scrape `search` as one search per subcategory ("skoda" -> "/skoda/").
+
+        Each is paged, deduplicated against the whole run and, past
+        SPLIT_THRESHOLD results, split like a root search (into price bands, as a
+        subcategory's own menu lists its siblings, not parts of it).
+        """
+        for i, sub in enumerate(subcategories):
+            if search.capped():
+                break
+            if self._past_deadline():
+                self.incomplete_reasons.append(
+                    f"{search.label}: run time budget reached; {len(subcategories) - i} of "
+                    f"{len(subcategories)} subcategories not scraped"
+                )
+                break
+            if i:
+                await asyncio.sleep(1)
+            path = f"/{sub}/"
+            name = self._search_name(search, path, search.price_min, search.price_max)
+            listings_before, pages_before = len(search.listings), self._pages_scraped
+            self._split_searches_left = MAX_SPLIT_SEARCHES
+            total = await self._scrape_search(search, path, search.price_min, search.price_max)
+            Actor.log.info(
+                f"{name}: {len(search.listings) - listings_before} listings from "
+                f"{self._pages_scraped - pages_before} pages (bazos reports "
+                f"{'no count' if total is None else total})"
+            )
+
     async def _scrape_search(
         self, search: _Search, path: str, lo: Optional[int], hi: Optional[int]
-    ) -> None:
+    ) -> Optional[int]:
         """Scrape one search: a subcategory `path` and price band [lo, hi] of `search`.
 
         bazos serves only the first SITE_RESULT_LIMIT results of a search, so one
@@ -314,7 +422,8 @@ class BazosScraper:
         listings without a price ("Dohodou", "V textu") that no price filter or
         price sort ever returns; or, if it is price-filtered anyway, into two price
         bands. One that can't be split is scraped as far as bazos serves it and the
-        run is recorded as incomplete.
+        run is recorded as incomplete. Returns the result count its page 1
+        reported (None: unknown).
         """
         name = self._search_name(search, path, lo, hi)
         self._split_searches_left -= 1
@@ -332,22 +441,23 @@ class BazosScraper:
                     f"{name}: more than {SITE_RESULT_LIMIT} results; bazos serves "
                     f"no more (stopped at offset {SITE_RESULT_LIMIT})"
                 )
-            return
+            return paged.total
 
         subpaths = self._subcategory_paths(paged.first_page[1]) if path == '/' else []
         if subpaths:
             await self._split_by_subcategory(search, subpaths, lo, hi, name, paged.total)
-            return
+            return paged.total
         if lo is not None or hi is not None:
             cut = _price_split_point(lo or 1, hi)
             if cut is not None:
                 await self._split_by_price(search, path, lo or 1, cut, hi, name)
-                return
+                return paged.total
         self.incomplete_reasons.append(
             f"{name}: {paged.total} results and no way to split them; bazos serves "
             f"only the newest {SITE_RESULT_LIMIT} of a search"
         )
         await self._scrape_pages(search, path, lo, hi, name, first_page=paged.first_page)
+        return paged.total
 
     async def _split_by_subcategory(
         self,
@@ -452,10 +562,7 @@ class BazosScraper:
                 )
                 break
 
-            url = self._build_search_url(
-                search.base_url, page_offset, search.query, search.location, lo, hi,
-                path=path,
-            )
+            url = self._search_url(search, path, page_offset, lo, hi)
 
             try:
                 if first_page is not None:
@@ -469,12 +576,21 @@ class BazosScraper:
                     soup = BeautifulSoup(response.content, 'lxml')
 
                 # Checked before raise_for_status(): bazos serves a page past the
-                # last result as a 404 that still renders the list header.
-                if self._is_end_of_results(soup):
+                # last result as a 404 that still renders the list header. Page 1
+                # is never past the end; a 404 there is a subcategory bazos doesn't
+                # have (rendered as the whole category's list).
+                at_end = self._is_end_of_results(soup)
+                if at_end and page_number > 1:
                     Actor.log.info(f"No more listings found for {name} on page {page_number}")
                     break
 
                 response.raise_for_status()
+                self._check_landed(response, search, path)
+
+                if at_end:  # page 1: the search has no results
+                    Actor.log.info(f"No listings found for {name}")
+                    result.total = 0
+                    break
 
                 if page_number == 1:
                     result.total = self._reported_total(soup)
@@ -530,22 +646,35 @@ class BazosScraper:
     ) -> Optional[int]:
         """Result count of a search's page 1 (0: no results; None: page failed)."""
         name = self._search_name(search, path, lo, hi)
-        url = self._build_search_url(
-            search.base_url, 0, search.query, search.location, lo, hi, path=path
-        )
+        url = self._search_url(search, path, 0, lo, hi)
         Actor.log.info(f"Reading the result count of {url}")
         try:
             response = await _request_with_retry(
                 self.client, "GET", url, follow_redirects=True, give_up=self._past_deadline
             )
+            response.raise_for_status()  # page 1: never a 404 (see _scrape_pages)
+            self._check_landed(response, search, path)
             soup = BeautifulSoup(response.content, 'lxml')
-            if self._is_end_of_results(soup):
-                return 0
-            response.raise_for_status()
         except Exception as e:
             self._record_page_failure(name, 1, url, e)
             return None
+        if self._is_end_of_results(soup):
+            return 0
         return self._reported_total(soup)
+
+    @staticmethod
+    def _check_landed(response, search: _Search, path: str) -> None:
+        """Raise _RedirectedAway if a page of `search`'s `path` came from elsewhere.
+
+        bazos redirects a subcategory it doesn't have, when searched with a query,
+        to the whole category's search (auto.bazos.cz/osobni/?hledat=x ->
+        /inzeraty/x/), whose listings must not pass for the subcategory's.
+        """
+        if (
+            response.url.host != urlparse(search.base_url).hostname
+            or not response.url.path.startswith(path)
+        ):
+            raise _RedirectedAway(response.url, subcategory=path != '/')
 
     def _record_page_failure(self, name: str, page_number: int, url: str, e: Exception) -> None:
         if isinstance(e, HTTPStatusError):
@@ -553,6 +682,9 @@ class BazosScraper:
             self.incomplete_reasons.append(
                 f"{name}: page {page_number} returned HTTP {e.response.status_code}"
             )
+        elif isinstance(e, _RedirectedAway):
+            Actor.log.error(f"{url} was {e}")
+            self.incomplete_reasons.append(f"{name}: page {page_number} was {e}")
         else:
             Actor.log.error(f"Error while scraping {url}: {e}")
             self.incomplete_reasons.append(
@@ -569,6 +701,16 @@ class BazosScraper:
             parts.append(_price_range_text(lo or 1, hi))
         return f"{search.label} [{', '.join(parts)}]" if parts else search.label
 
+    def _search_url(
+        self, search: _Search, path: str, page_offset: int, lo: Optional[int], hi: Optional[int]
+    ) -> str:
+        """URL of a page of `search`'s subcategory `path` and price band [lo, hi],
+        with all of the search's filters (every list page is fetched through this)."""
+        return self._build_search_url(
+            search.base_url, page_offset, search.query, search.location, lo, hi,
+            path=path, radius=search.radius,
+        )
+
     def _build_search_url(
         self,
         base_url: str,
@@ -578,8 +720,10 @@ class BazosScraper:
         price_min: Optional[int] = None,
         price_max: Optional[int] = None,
         path: str = '/',
+        radius: Optional[int] = None,
     ) -> str:
-        """Build search URL with filters and pagination (`path`: a subcategory)."""
+        """Build search URL with filters and pagination (`path`: a subcategory;
+        `radius`: km around `location`, which alone means its postal code only)."""
 
         if page_offset == 0:
             url = f"{base_url}{path}"
@@ -592,6 +736,8 @@ class BazosScraper:
             params.append(f"hledat={search_query}")
         if location:
             params.append(f"hlokalita={location}")
+            if radius:
+                params.append(f"humkreis={radius}")
         if price_min:
             params.append(f"cenaod={price_min}")
         if price_max:
@@ -981,51 +1127,82 @@ async def main() -> None:
         max_listings = actor_input.get('maxListings', 100)
         include_detailed_data = actor_input.get('includeDetailedData', True)
         search_query = actor_input.get('searchQuery')
-        location = actor_input.get('location')
+        location = str(actor_input.get('location') or '').strip() or None
         price_min = actor_input.get('priceMin')
         price_max = actor_input.get('priceMax')
-        
+        radius = _radius_km(actor_input.get('radius'))
+        subcategories, bad_subcategories = _parse_subcategories(actor_input.get('subcategories'))
+        location_label = str(actor_input.get('locationLabel') or '').strip() or None
+        if radius and not location:
+            Actor.log.warning(f"Radius {radius} km ignored: it only applies around a location")
+            radius = None
+        # Names this run's slice for the app's sold detection (see _location_filter).
+        location_filter = _location_filter(location, radius, location_label)
+
         # Get actor run information
         actor_run_id = os.environ.get('APIFY_ACTOR_RUN_ID') or os.environ.get('ACTOR_RUN_ID')
         if not actor_run_id:
             actor_run_id = f"local-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         actor_run_start = datetime.now()
-        
+
         Actor.log.info(f"Starting Bazos.cz scraper with categories: {categories}")
+        if subcategories:
+            Actor.log.info(
+                f"Subcategories, each searched on its own ({len(subcategories)}): "
+                f"{', '.join(subcategories)}"
+            )
         Actor.log.info(f"Max listings per category: {max_listings} (0 = unlimited)")
         Actor.log.info(f"Include detailed data: {include_detailed_data}")
         Actor.log.info(f"Actor Run ID: {actor_run_id}")
         if search_query:
             Actor.log.info(f"Search query: {search_query}")
         if location:
-            Actor.log.info(f"Location filter: {location}")
+            radius_text = f" + {radius} km" if radius else " (no radius)"
+            Actor.log.info(f"Location filter: {location}{radius_text}")
+        if location_filter:
+            Actor.log.info(f"Run slice (actor_runs.location_filter): {location_filter}")
         if price_min or price_max:
             Actor.log.info(f"Price range: {price_min or 0} - {price_max or 'unlimited'} CZK")
-        
+
         # Initialize database connection
         try:
             # Get scraper name from environment or use default
             scraper_name = os.environ.get('SCRAPER_NAME', 'bazos_scraper')
             db_manager.scraper_name = scraper_name
-            
+
+            # database.py falls back to localhost when DB_HOST is unset, which only
+            # ever works on a dev machine. On the platform that means the Actor
+            # version has no DB_* environment variables (env vars are per version).
+            if Actor.is_at_home() and not os.environ.get('DB_HOST'):
+                raise RuntimeError(
+                    "DB_HOST is not set: add the DB_* environment variables to the "
+                    "Actor version this build belongs to"
+                )
+
             db_manager.initialize_pool()
             db_manager.set_actor_run_info(actor_run_id, actor_run_start)
-            
+
             # Create actor run record in database
             db_manager.create_actor_run(
                 categories=categories,
                 max_listings=max_listings,
                 search_query=search_query,
-                location=location,
+                location=location_filter,
                 price_min=price_min,
                 price_max=price_max
             )
-            
+
             Actor.log.info("Database connection established and actor run created")
             db_manager_available = True
-            
+
         except Exception as e:
             Actor.log.error(f"Failed to initialize database: {e}")
+            if Actor.is_at_home():
+                # The database is the point of a platform run: without it nothing
+                # reaches the map. Carrying on made a run "succeed" with its data
+                # only in the dataset, which hid another scraper's missing-env-vars
+                # deploy for three months. Fail loudly, before scraping anything.
+                raise
             Actor.log.warning("Continuing without database integration")
             db_manager_available = False
         
@@ -1050,7 +1227,13 @@ async def main() -> None:
             saved_count = 0  # rows actually inserted into the database
             # Shared with the scraper, which adds its paging failures here.
             incomplete_reasons = scraper.incomplete_reasons
-            
+            for entry in bad_subcategories:
+                Actor.log.error(f"Subcategory {entry!r} is not a bazos path; skipping it")
+                incomplete_reasons.append(f"subcategory {entry!r} is not a bazos path (skipped)")
+            if bad_subcategories and not subcategories:
+                # Not the categories' roots instead: a far bigger, other search.
+                categories = []
+
             # Scrape each category
             for category_index, category in enumerate(categories):
                 if scraper._past_deadline():
@@ -1082,7 +1265,9 @@ async def main() -> None:
                         search_query=search_query,
                         location=location,
                         price_min=price_min,
-                        price_max=price_max
+                        price_max=price_max,
+                        radius=radius,
+                        subcategories=subcategories,
                     )
                     
                     # Scrape detailed data if requested (coordinates come only
@@ -1165,6 +1350,8 @@ async def main() -> None:
                 status_message = f"Failed: no listings saved to the database ({len(all_listings)} scraped)"
             else:
                 status_message = f"Completed: {len(all_listings)} listings scraped from {len(categories)} categories"
+                if subcategories:
+                    status_message += f" ({len(subcategories)} subcategories each)"
             try:
                 await Actor.set_status_message(status_message)
             except Exception as e:

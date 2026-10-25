@@ -22,12 +22,17 @@ A comprehensive Apify Actor for scraping classified advertisements from Bazos.cz
 
 ### Optional Parameters
 
-- **maxListings** (integer): Maximum listings per category (default: 100, 0 = unlimited)
+- **subcategories** (array of strings): Scrape these subcategories of each selected category, each as its own search, instead of the whole category. An entry is the path on the category's site: `skoda` for `auto.bazos.cz/skoda/`, `prodam/byt` for `reality.bazos.cz/prodam/byt/`. Listings keep the category (e.g. `auto`) as their `category`. A subcategory bazos doesn't have (404, or a redirect away from its path) fails the run.
+- **maxListings** (integer): Maximum listings per category, all its subcategories together (default: 100, 0 = unlimited)
 - **includeDetailedData** (boolean): Whether to scrape detailed info from individual pages (default: true)
 - **searchQuery** (string): Search term to filter listings
-- **location** (string): Location filter (city or postal code)
+- **location** (string): Location filter: a postal code (PSČ) such as `60200`. Alone it matches only that postal code; a town name is resolved by bazos in its own way, so prefer postal codes.
+- **radius** (integer, km, at least 1): Search radius around `location` (bazos's `humkreis`); ignored without a location
+- **locationLabel** (string): Readable name of the searched area, stored as the run's `location_filter` (default: `"<location> +<radius> km"`, or the location). The web app treats runs with the same search query and `location_filter` as one slice for sold detection, so each regional scraper row needs its own value.
 - **priceMin** (integer): Minimum price filter in CZK
 - **priceMax** (integer): Maximum price filter in CZK
+
+On the Apify platform a run without a database (`DB_HOST` unset, or the connection fails) fails at once instead of scraping into the dataset only; local runs carry on without one.
 
 ## Example Input
 
@@ -90,6 +95,24 @@ A comprehensive Apify Actor for scraping classified advertisements from Bazos.cz
   "priceMax": 1000000
 }
 ```
+
+### Passenger Cars in One Region (weekly regional fleet row)
+Passenger cars are not one page on bazos but 27 subcategories of `auto.bazos.cz`, so a row lists them all:
+```json
+{
+  "categories": ["auto"],
+  "subcategories": ["alfa", "audi", "bmw", "citroen", "dacia", "fiat", "ford", "honda", "hyundai",
+                    "chevrolet", "kia", "mazda", "mercedes", "mitsubishi", "nissan", "opel", "peugeot",
+                    "renault", "seat", "suzuki", "skoda", "toyota", "volkswagen", "volvo", "ostatni",
+                    "havarovana", "veterani"],
+  "location": "60200",
+  "radius": 50,
+  "locationLabel": "Brno +50 km",
+  "maxListings": 0,
+  "includeDetailedData": true
+}
+```
+A subcategory reporting more than 19,500 results (bazos serves 20,000 per search) is split into price bands when a price filter is set; without one the run is marked failed, so keep the radius regional (nationwide, `skoda` alone has ~31,000 listings).
 
 ### Electronics Price Monitoring
 ```json

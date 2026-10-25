@@ -56,10 +56,16 @@
                 ]
             }
         },
+        "subcategories": {
+            "title": "Subcategories",
+            "type": "array",
+            "description": "Optional. Scrape these subcategories of each selected category, each as its own search, instead of the category as a whole. An entry is the subcategory's path on the category's site: \"skoda\" for auto.bazos.cz/skoda/, \"prodam/byt\" for reality.bazos.cz/prodam/byt/. Listings keep the category (e.g. \"auto\") as their category. A subcategory bazos doesn't have fails the run.",
+            "editor": "stringList"
+        },
         "maxListings": {
             "title": "Maximum listings per category",
             "type": "integer",
-            "description": "Maximum number of listings to scrape per category (0 = unlimited)",
+            "description": "Maximum number of listings to scrape per category, all its subcategories together (0 = unlimited)",
             "minimum": 0
         },
         "includeDetailedData": {
@@ -75,8 +81,20 @@
         },
         "location": {
             "title": "Location filter",
-            "type": "string", 
-            "description": "Optional location (city or postal code) to filter listings",
+            "type": "string",
+            "description": "Optional location to filter listings: a postal code (PSČ) such as \"60200\". Without a radius bazos returns only that postal code's listings. (A town name is resolved by bazos in its own way; prefer postal codes.)",
+            "editor": "textfield"
+        },
+        "radius": {
+            "title": "Radius (km)",
+            "type": "integer",
+            "description": "Optional search radius around the location, in km (bazos's \"humkreis\"). Ignored without a location.",
+            "minimum": 1
+        },
+        "locationLabel": {
+            "title": "Location label",
+            "type": "string",
+            "description": "Optional readable name of the searched area (e.g. \"Jihomoravský kraj\"), stored as the run's location filter. The app treats runs with the same search query and location filter as one slice for sold detection, so each regional scraper row needs its own value. Default: \"<location> +<radius> km\" when a radius is set, otherwise the location.",
             "editor": "textfield"
         },
         "priceMin": {
