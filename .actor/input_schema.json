@@ -65,8 +65,9 @@
         "maxListings": {
             "title": "Maximum listings per category",
             "type": "integer",
-            "description": "Maximum number of listings to scrape per category, all its subcategories together (0 = unlimited)",
-            "minimum": 0
+            "description": "Maximum number of listings to scrape per category, all its subcategories together (0 = unlimited, the default)",
+            "minimum": 0,
+            "default": 0
         },
         "includeDetailedData": {
             "title": "Include detailed data",

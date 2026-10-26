@@ -1266,7 +1266,7 @@ async def main() -> None:
         if not categories or len(categories) == 0:
             categories = ['auto']
         
-        max_listings = actor_input.get('maxListings', 100)
+        max_listings = int(actor_input.get('maxListings') or 0)  # absent: unlimited
         include_detailed_data = actor_input.get('includeDetailedData', True)
         search_query = actor_input.get('searchQuery')
         location = str(actor_input.get('location') or '').strip() or None

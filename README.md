@@ -23,7 +23,7 @@ A comprehensive Apify Actor for scraping classified advertisements from Bazos.cz
 ### Optional Parameters
 
 - **subcategories** (array of strings): Scrape these subcategories of each selected category, each as its own search, instead of the whole category. An entry is the path on the category's site: `skoda` for `auto.bazos.cz/skoda/`, `prodam/byt` for `reality.bazos.cz/prodam/byt/`. Listings keep the category (e.g. `auto`) as their `category`. A subcategory bazos doesn't have (404, or a redirect away from its path) fails the run.
-- **maxListings** (integer): Maximum listings per category, all its subcategories together (default: 100, 0 = unlimited)
+- **maxListings** (integer): Maximum listings per category, all its subcategories together (default: 0 = unlimited)
 - **includeDetailedData** (boolean): Whether to scrape detailed info from individual pages (default: true)
 - **searchQuery** (string): Search term to filter listings
 - **location** (string): Location filter: a postal code (PSČ) such as `60200`. Alone it matches only that postal code; a town name is resolved by bazos in its own way, so prefer postal codes.
