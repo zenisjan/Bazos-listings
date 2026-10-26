@@ -120,6 +120,14 @@ MAX_SPLIT_SEARCHES = 200
 # leaving listings out.
 _SPLIT_COVERAGE_SLACK = 5
 
+# A later list page that is bazos's own (it has the results header) but no cards ends
+# the search if it starts within this share, or count, of the total bazos reports: the
+# count lags behind expiring listings (2026-10-26, near midnight: /prodam/dum/ still
+# promised page 434 after the list had shrunk by ~100 since page 1). Further from that
+# end an empty page is a fault, and the run is incomplete.
+STALE_COUNT_SLACK_SHARE = 0.03
+STALE_COUNT_SLACK_MIN = 60
+
 # Results header of a list page, e.g. "Zobrazeno 21-40 inzerátů z 15 829".
 _RESULTS_RE = re.compile(r'Zobrazeno\s+(\d+)\s*-\s*\d+\s+\w+\s+z\s+(\d[\d\s]*)')
 
@@ -727,9 +735,19 @@ class BazosScraper:
                 page_listings = self._extract_listings_from_page(soup, search.category, search.base_url)
 
                 if not page_listings and not soup.find('div', class_='inzeraty inzeratyflex'):
+                    reported = self._reported_total(soup) if page_number > 1 else None
+                    if reported is not None and page_offset >= reported - max(
+                        STALE_COUNT_SLACK_MIN, STALE_COUNT_SLACK_SHARE * reported
+                    ):
+                        Actor.log.info(
+                            f"No more listings for {name} on page {page_number}: bazos "
+                            f"still counts {reported}, but the list ends before {page_offset + 1}"
+                        )
+                        break
                     # Not bazos's end-of-results page, so this is a block/consent
                     # page or a layout change, not the end of the list.
-                    Actor.log.error(f"No parsable listings on {url}")
+                    title = soup.title.get_text(strip=True)[:80] if soup.title else ""
+                    Actor.log.error(f"No parsable listings on {url} (page title {title!r})")
                     self.incomplete_reasons.append(
                         f"{name}: page {page_number} had no parsable listings"
                     )
