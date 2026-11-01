@@ -106,8 +106,9 @@ DETAIL_MIN_INTERVAL_SECS = 0.25
 DETAIL_FAILURE_SHARE_LIMIT = 0.02
 DETAIL_FAILURE_COUNT_LIMIT = 20
 
-# bazos serves at most this many results for one search URL: the page at offset
-# 20,000 is a 404 that re-serves the last cards ("Zobrazeno 19981-20000 ... z N").
+# bazos serves a search URL's list pages only at offsets below this: with 60 results
+# a page (since 2026-11-01; 20 before) the last is offset 19,980 ("Zobrazeno
+# 19981-20040 ... z N"), and the next is a 404 that re-serves its cards.
 SITE_RESULT_LIMIT = 20_000
 # A search reporting more results than this is split into smaller searches (see
 # BazosScraper._scrape_search); the margin absorbs listings added while paging.
@@ -128,8 +129,9 @@ _SPLIT_COVERAGE_SLACK = 5
 STALE_COUNT_SLACK_SHARE = 0.03
 STALE_COUNT_SLACK_MIN = 60
 
-# Results header of a list page, e.g. "Zobrazeno 21-40 inzerátů z 15 829".
-_RESULTS_RE = re.compile(r'Zobrazeno\s+(\d+)\s*-\s*\d+\s+\w+\s+z\s+(\d[\d\s]*)')
+# Results header of a list page, e.g. "Zobrazeno 61-120 inzerátů z 15 690": the first
+# and last result it shows, and the total.
+_RESULTS_RE = re.compile(r'Zobrazeno\s+(\d+)\s*-\s*(\d+)\s+\w+\s+z\s+(\d[\d\s]*)')
 
 
 def _slice_label(category: str, search_query: Optional[str]) -> str:
@@ -767,6 +769,13 @@ class BazosScraper:
 
                 has_next, next_offset = self._check_next_page(soup, page_offset)
                 if not has_next:
+                    if self._results_shown(soup) is None:
+                        # Without bazos's results header nothing says the list
+                        # ended here (a layout change); a run that passed this
+                        # for the end would have the rest counted as sold.
+                        self.incomplete_reasons.append(
+                            f"{name}: page {page_number} has no results header"
+                        )
                     Actor.log.info(f"No next page found after page {page_number}")
                     break
                 if next_offset >= SITE_RESULT_LIMIT:
@@ -1178,7 +1187,7 @@ class BazosScraper:
         """True if this is bazos's own "nothing (more) to show" list page.
 
         An empty search says "Žádný inzerát nenalezen"; a page past the last
-        result (served as 404) says e.g. "Zobrazeno 821-806 inzerátů z 806".
+        result (served as 404) says e.g. "Zobrazeno 9061-9015 inzerátů z 9 015".
         Any other page without listings (block page, layout change) is not.
         """
         if soup.find('div', class_='inzeraty inzeratyflex'):
@@ -1186,17 +1195,24 @@ class BazosScraper:
         header = soup.find('div', class_='listainzerat')
         if not header:
             return False
-        text = header.get_text(' ', strip=True)
-        if 'Žádný inzerát nenalezen' in text:
+        if 'Žádný inzerát nenalezen' in header.get_text(' ', strip=True):
             return True
-        match = _RESULTS_RE.search(text)
-        return bool(match) and int(match.group(1)) > int(re.sub(r'\D', '', match.group(2)))
+        shown = self._results_shown(soup)
+        return shown is not None and shown[0] > shown[2]
 
-    def _reported_total(self, soup: BeautifulSoup) -> Optional[int]:
-        """Result count from a list page's header ("Zobrazeno 1-20 inzerátů z 15 829")."""
+    def _results_shown(self, soup: BeautifulSoup) -> Optional[tuple[int, int, int]]:
+        """First and last result a list page shows, and the total, from its header
+        ("Zobrazeno 61-120 inzerátů z 15 690"; the total has thousands separators)."""
         header = soup.find('div', class_='listainzerat')
         match = _RESULTS_RE.search(header.get_text(' ', strip=True)) if header else None
-        return int(re.sub(r'\D', '', match.group(2))) if match else None
+        if not match:
+            return None
+        return int(match.group(1)), int(match.group(2)), int(re.sub(r'\D', '', match.group(3)))
+
+    def _reported_total(self, soup: BeautifulSoup) -> Optional[int]:
+        """Result count from a list page's header."""
+        shown = self._results_shown(soup)
+        return shown[2] if shown else None
 
     def _subcategory_paths(self, soup: BeautifulSoup) -> List[str]:
         """The category's subcategories ("/prodam/byt/", ...) from a list page's menu.
@@ -1212,8 +1228,12 @@ class BazosScraper:
         return paths
 
     def _check_next_page(self, soup: BeautifulSoup, current_offset: int) -> tuple[bool, int]:
-        """Enhanced method to check for next page and return next offset."""
-        
+        """Whether a list page has a next page, and that page's offset.
+
+        Never a guessed page size: bazos answers an offset off its page grid with
+        a 404 (pages hold 60 results since 2026-11-01, so /20/ is one; 20 before).
+        """
+
         # Method 1: Check pagination section
         pagination = soup.find('div', class_='strankovani')
         if pagination:
@@ -1221,7 +1241,7 @@ class BazosScraper:
             next_link = pagination.find('a', string=re.compile(r'Další|Next'))
             if next_link:
                 href = next_link.get('href', '')
-                # Extract offset from URL like "/20/" or "/40/"
+                # Extract offset from URL like "/60/" or "/120/"
                 offset_match = re.search(r'/(\d+)/', href)
                 if offset_match:
                     next_offset = int(offset_match.group(1))
@@ -1237,18 +1257,11 @@ class BazosScraper:
                     if offset > current_offset:
                         return True, offset
         
-        # Method 2: Check if we have listings on current page
-        # If we have 20 listings (full page), there might be more
-        listing_containers = soup.find_all('div', class_='inzeraty inzeratyflex')
-        if len(listing_containers) >= 20:  # Full page typically has 20 listings
-            next_offset = current_offset + 20
-            return True, next_offset
-        
-        # Method 3: the "Zobrazeno 1-20 inzerátů z 15 829" header (the total has
-        # thousands separators)
-        total_listings = self._reported_total(soup)
-        if total_listings is not None and current_offset + 20 < total_listings:
-            return True, current_offset + 20
+        # Method 2: the results header, for a search's pages (they page by form
+        # submits, not links): "Zobrazeno 61-120 inzerátů z 15 690" goes on at 120
+        shown = self._results_shown(soup)
+        if shown is not None and current_offset < shown[1] < shown[2]:
+            return True, shown[1]
 
         return False, current_offset
 
