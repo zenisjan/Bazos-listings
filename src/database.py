@@ -26,6 +26,27 @@ import os
 from apify import Actor
 
 
+# The largest number each numeric column of listings holds. One value beyond it failed the
+# whole insert, and with it every listing of the run (Sreality, 2026-11-03: a 30 m² flat
+# typed as 7,290,000,000 Kč lost all 6,010), so insert_listings stores it as NULL instead.
+COLUMN_LIMITS = {
+    'price': 2_147_483_647,  # integer
+    'views': 2_147_483_647,  # integer
+    'coordinates_lat': 90,   # numeric(10,8) holds under 100; no latitude is beyond 90
+    'coordinates_lng': 180,  # numeric(11,8) holds under 1000
+}
+
+
+def _fit_column(listing: Dict[str, Any], column: str, value: Any) -> Any:
+    """value, or None (logged) when it is a number beyond COLUMN_LIMITS[column]."""
+    if not isinstance(value, (int, float)) or abs(value) <= COLUMN_LIMITS[column]:
+        return value  # NaN fails the comparison, so it is dropped too
+    Actor.log.warning(
+        f"Listing {listing.get('id')}: {column} {value} doesn't fit the column, stored as NULL"
+    )
+    return None
+
+
 class DatabaseManager:
     """Manages PostgreSQL database connections and operations."""
 
@@ -288,19 +309,19 @@ class DatabaseManager:
                     listing.get('title', ''),
                     listing.get('url', ''),
                     listing.get('category', ''),
-                    listing.get('price'),
+                    _fit_column(listing, 'price', listing.get('price')),
                     listing.get('price_text', ''),
                     listing.get('description', ''),
                     listing.get('full_description', ''),
                     listing.get('location', ''),
-                    listing.get('views', 0),
+                    _fit_column(listing, 'views', listing.get('views', 0)),
                     listing.get('date', ''),
                     listing.get('is_top', False),
                     listing.get('image_url', ''),
                     listing.get('contact_name', ''),
                     listing.get('phone', ''),
-                    coords_lat,
-                    coords_lng,
+                    _fit_column(listing, 'coordinates_lat', coords_lat),
+                    _fit_column(listing, 'coordinates_lng', coords_lng),
                     images_json,
                     similar_json,
                     datetime.fromisoformat(listing.get('scraped_at', datetime.now().isoformat()))
